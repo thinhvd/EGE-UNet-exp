@@ -1,0 +1,12 @@
+# EGE-UNet runtime dependencies.
+# On Google Colab all of these are preinstalled, so `pip install -r requirements.txt`
+# is effectively a no-op there. This file is mainly for local environments.
+torch>=1.13        # torch.load(weights_only=...) used by the resume logic
+torchvision>=0.13  # antialias kwarg of torchvision.transforms.functional.resize
+numpy
+Pillow
+scikit-learn
+matplotlib
+tqdm
+tensorboard        # backend for torch.utils.tensorboard
+# scipy (installed as a scikit-learn dependency) is used optionally by analysis/compare_runs.py (Wilcoxon test)

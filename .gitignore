@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# experiment outputs
+results/*
+!results/readme.md
+
+paper/
+
+# datasets (too large for git; keep the placeholder readme)
+data/*
+!data/readme.md
+
+pre_trained/
