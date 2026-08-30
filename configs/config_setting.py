@@ -16,6 +16,7 @@ class setting_config:
         'bridge': True,
         'gt_ds': True,
         'hpa_mode': 'learnable',  # GHPA static-prior ablation: 'learnable' (original) | 'frozen_ones' | 'none'
+        'ghpa_stages': None,      # None = original placement; see models.egeunet.GHPA_PLACEMENTS ('low'/'mid'/'high')
     }
 
     datasets = 'isic17'
@@ -194,6 +195,13 @@ def get_config(args=None):
     hpa_mode = getattr(args, 'hpa_mode', None)
     if hpa_mode is not None:
         config.model_config['hpa_mode'] = hpa_mode
+    stages_str = getattr(args, 'ghpa_stages', None)
+    placement = getattr(args, 'ghpa_placement', None)
+    if stages_str is not None:
+        config.model_config['ghpa_stages'] = [s.strip() for s in stages_str.split(',') if s.strip()]
+    elif placement is not None:
+        from models.egeunet import GHPA_PLACEMENTS
+        config.model_config['ghpa_stages'] = GHPA_PLACEMENTS[placement]
     config.device = args.device
     config.no_resume = args.no_resume
     return config

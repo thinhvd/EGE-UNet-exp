@@ -92,6 +92,16 @@ class group_aggregation_bridge(nn.Module):
 
 HPA_MODES = ('learnable', 'frozen_ones', 'none')
 
+# Where the six GHPA modules sit (3 encoder + 3 decoder stages), grouped by operating resolution
+# with a 256x256 input. 'low' is the original EGE-UNet. enc1 is not eligible (input has 3 channels,
+# GHPA needs dim_in divisible by 4).
+GHPA_PLACEMENTS = {
+    'low':  ['enc4', 'enc5', 'enc6', 'dec1', 'dec2', 'dec3'],   # res {32,16,8 | 8,8,16}  (original)
+    'mid':  ['enc3', 'enc4', 'enc5', 'dec2', 'dec3', 'dec4'],   # res {64,32,16 | 8,16,32}
+    'high': ['enc2', 'enc3', 'enc4', 'dec3', 'dec4', 'dec5'],   # res {128,64,32 | 16,32,64}
+}
+_GHPA_ALLOWED_STAGES = ('enc2', 'enc3', 'enc4', 'enc5', 'enc6', 'dec1', 'dec2', 'dec3', 'dec4', 'dec5')
+
 
 class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
     '''
@@ -178,33 +188,50 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
 
 class EGEUNet(nn.Module):
     
-    def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True, hpa_mode='learnable'):
+    def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True,
+                 hpa_mode='learnable', ghpa_stages=None):
         super().__init__()
 
         self.bridge = bridge
         self.gt_ds = gt_ds
         self.hpa_mode = hpa_mode
+        if ghpa_stages is None:
+            ghpa_stages = GHPA_PLACEMENTS['low']
+        ghpa_stages = list(ghpa_stages)
+        for s in ghpa_stages:
+            if s not in _GHPA_ALLOWED_STAGES:
+                raise ValueError(f'invalid GHPA stage {s!r}; allowed: {_GHPA_ALLOWED_STAGES}')
+        self.ghpa_stages = ghpa_stages
 
-        self.encoder1 = nn.Sequential(
-            nn.Conv2d(input_channels, c_list[0], 3, stride=1, padding=1),
-        )
-        self.encoder2 =nn.Sequential(
-            nn.Conv2d(c_list[0], c_list[1], 3, stride=1, padding=1),
-        )
-        self.encoder3 = nn.Sequential(
-            nn.Conv2d(c_list[1], c_list[2], 3, stride=1, padding=1),
-        )
-        self.encoder4 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[2], c_list[3], hpa_mode=hpa_mode),
-        )
-        self.encoder5 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[3], c_list[4], hpa_mode=hpa_mode),
-        )
-        self.encoder6 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[4], c_list[5], hpa_mode=hpa_mode),
-        )
+        # channel dims per stage; a stage is either the original plain Conv2d 3x3 or a GHPA block.
+        # Construction ORDER must stay identical to the original so the default placement is
+        # bit-identical (module __init__ consumes RNG).
+        enc_dims = [(input_channels, c_list[0]), (c_list[0], c_list[1]), (c_list[1], c_list[2]),
+                    (c_list[2], c_list[3]), (c_list[3], c_list[4]), (c_list[4], c_list[5])]
+        dec_dims = [(c_list[5], c_list[4]), (c_list[4], c_list[3]), (c_list[3], c_list[2]),
+                    (c_list[2], c_list[1]), (c_list[1], c_list[0])]
+
+        def _stage(tag, dim_in, dim_out):
+            if tag in ghpa_stages:
+                if dim_in % 4 != 0:
+                    raise ValueError(f'GHPA at {tag} needs dim_in divisible by 4, got {dim_in}')
+                return nn.Sequential(
+                    Grouped_multi_axis_Hadamard_Product_Attention(dim_in, dim_out, hpa_mode=hpa_mode),
+                )
+            return nn.Sequential(
+                nn.Conv2d(dim_in, dim_out, 3, stride=1, padding=1),
+            )
+
+        self.encoder1 = _stage('enc1', *enc_dims[0])
+        self.encoder2 = _stage('enc2', *enc_dims[1])
+        self.encoder3 = _stage('enc3', *enc_dims[2])
+        self.encoder4 = _stage('enc4', *enc_dims[3])
+        self.encoder5 = _stage('enc5', *enc_dims[4])
+        self.encoder6 = _stage('enc6', *enc_dims[5])
         if hpa_mode != 'learnable':
             print(f'GHPA hpa_mode = {hpa_mode}')
+        if ghpa_stages != GHPA_PLACEMENTS['low']:
+            print(f'GHPA placement = {ghpa_stages}')
 
         if bridge: 
             self.GAB1 = group_aggregation_bridge(c_list[1], c_list[0])
@@ -221,21 +248,11 @@ class EGEUNet(nn.Module):
             self.gt_conv5 = nn.Sequential(nn.Conv2d(c_list[0], 1, 1))
             print('gt deep supervision was used')
         
-        self.decoder1 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[5], c_list[4], hpa_mode=hpa_mode),
-        )
-        self.decoder2 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[4], c_list[3], hpa_mode=hpa_mode),
-        )
-        self.decoder3 = nn.Sequential(
-            Grouped_multi_axis_Hadamard_Product_Attention(c_list[3], c_list[2], hpa_mode=hpa_mode),
-        )
-        self.decoder4 = nn.Sequential(
-            nn.Conv2d(c_list[2], c_list[1], 3, stride=1, padding=1),
-        )  
-        self.decoder5 = nn.Sequential(
-            nn.Conv2d(c_list[1], c_list[0], 3, stride=1, padding=1),
-        )  
+        self.decoder1 = _stage('dec1', *dec_dims[0])
+        self.decoder2 = _stage('dec2', *dec_dims[1])
+        self.decoder3 = _stage('dec3', *dec_dims[2])
+        self.decoder4 = _stage('dec4', *dec_dims[3])
+        self.decoder5 = _stage('dec5', *dec_dims[4])
         self.ebn1 = nn.GroupNorm(4, c_list[0])
         self.ebn2 = nn.GroupNorm(4, c_list[1])
         self.ebn3 = nn.GroupNorm(4, c_list[2])

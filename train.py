@@ -45,6 +45,12 @@ def parse_args():
                              'conv_xy/zx/zy still trained), none (no Hadamard gating). Default: config value (learnable)')
     parser.add_argument('--seed', type=int, default=None,
                         help='random seed (default 42 from config); use different seeds for multi-seed ablations')
+    parser.add_argument('--ghpa-placement', type=str, default=None, choices=['low', 'mid', 'high'],
+                        help='which resolution band holds the six GHPA modules (see models.egeunet.GHPA_PLACEMENTS); '
+                             'low = original placement')
+    parser.add_argument('--ghpa-stages', type=str, default=None,
+                        help='free-form comma list of GHPA stages, e.g. "enc3,enc4,enc5,dec2,dec3,dec4" '
+                             '(overrides --ghpa-placement)')
     return parser.parse_args()
 
 
@@ -107,12 +113,14 @@ def main(config):
                         bridge=model_cfg['bridge'],
                         gt_ds=model_cfg['gt_ds'],
                         hpa_mode=model_cfg.get('hpa_mode', 'learnable'),
+                        ghpa_stages=model_cfg.get('ghpa_stages'),
                         )
     else: raise Exception('network in not right!')
     model = model.to(config.device)
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log_info = f'hpa_mode: {model_cfg.get("hpa_mode", "learnable")}, params: {n_total} total / {n_trainable} trainable'
+    log_info = (f'hpa_mode: {model_cfg.get("hpa_mode", "learnable")}, '
+                f'ghpa_stages: {model.ghpa_stages}, params: {n_total} total / {n_trainable} trainable')
     print(log_info)
     logger.info(log_info)
 

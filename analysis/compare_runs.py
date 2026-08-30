@@ -38,7 +38,8 @@ def parse_args():
                    help='a run (one dir/csv) or a group of seeds (comma-separated); repeatable; first = reference')
     p.add_argument('--csv-name', default='per_image_metrics.csv',
                    help='csv file name under <dir>/analysis/ (e.g. per_image_metrics_shift32_0.csv)')
-    p.add_argument('--metric', default='dsc', choices=['dsc', 'iou'])
+    p.add_argument('--metric', default='dsc',
+                   help='numeric csv column to compare (e.g. dsc, iou, oracle_dsc)')
     p.add_argument('--n-strata', type=int, default=3)
     p.add_argument('--n-boot', type=int, default=10000)
     p.add_argument('--seed', type=int, default=0)
@@ -101,6 +102,9 @@ def main():
 
     tables = {label: [load_csv(p) for p in paths] for label, paths in groups}
     first = tables[ref_label][0]
+    probe = next(iter(first.values()))
+    if args.metric not in probe or probe[args.metric] in ('', None):
+        raise SystemExit(f'metric column {args.metric!r} not found (or empty) in the csv; available: {list(probe)}')
     files = list(first.keys())
     common = [f for f in files if all(f in t for tabs in tables.values() for t in tabs)]
     if len(common) < len(files):
@@ -214,7 +218,9 @@ def main():
                    label=label, yerr=[means - lo, hi - means], capsize=2, error_kw={'lw': 0.8})
         ax.set_xticks(x); ax.set_xticklabels([t.replace(' (', '\n(') for t in tags], fontsize=8)
         ymin = min(r['ci_lo'] for r in rows if r['stratification'] == strat_name)
-        ax.set_ylim(max(0.0, ymin - 0.05), 1.0)
+        ymax = max(r['ci_hi'] for r in rows if r['stratification'] == strat_name)
+        pad = 0.05 * max(ymax - ymin, 1e-6)
+        ax.set_ylim(ymin - pad, min(1.0, ymax + pad) if ymax <= 1.0 else ymax + pad)
         ax.set_ylabel(args.metric.upper())
         ax.set_title(f'{args.metric.upper()} by {strat_name} tertile (bars = mean, whiskers = bootstrap 95% CI)', fontsize=9)
         ax.grid(axis='y', alpha=0.25)

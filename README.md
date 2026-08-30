@@ -62,6 +62,10 @@ Open [colab_train.ipynb](colab_train.ipynb) in Colab, fill in the parameters cel
 
 In GHPA the feature groups are multiplied by gates `conv_xy(BI(P_xy))`, `conv_zx(BI(P_zx))`, `conv_zy(BI(P_zy))` whose learnable tensors `P` have batch dimension 1 — the gates do **not** depend on the input image, so after training they are static per-channel spatial priors shared by all images (not data-dependent attention). The tools below measure what these priors learn (e.g. the centered-lesion bias of ISIC) and how much they contribute.
 
+*GHPA placement* (`--ghpa-placement {low,mid,high}` or free-form `--ghpa-stages "enc3,enc4,..."`): moves the six GHPA modules to a different resolution band while keeping their count — a controlled experiment for whether the gate's operating resolution decides which lesion scale it helps. `low` = original (enc4/5/6 + dec1/2/3, res 32/16/8 | 8/8/16); `mid` = enc3/4/5 + dec2/3/4 (64/32/16 | 8/16/32); `high` = enc2/3/4 + dec3/4/5 (128/64/32 | 16/32/64). Caveat: parameter counts are NOT matched (plain 3×3 convs at wide low-res stages are expensive: low 53,374 / mid 91,966 / high 111,390 params) — read the per-tertile *pattern shift*, not absolute gains.
+
+*Evaluation extras* in `analysis/eval_per_image.py`: `--thresholds 0.3,0.4,...` sweeps thresholds in one forward pass (per-threshold pooled/mean/per-tertile DSC in the sidecar json — the calibration diagnostic), and the `oracle_dsc` csv column scores a size-matched prediction (exactly k = |GT| highest-probability pixels), removing any area/calibration bias by construction.
+
 *Model variants* (`--hpa-mode`, applied to all six GHPA modules enc4/5/6 + dec1/2/3):
 - `learnable` — original model (53,374 params).
 - `frozen_ones` — `P` is kept at its init (ones) and not trained; `conv_xy/zx/zy` are still trained. Caveat: the conv of a constant map is a per-channel constant in the interior plus a 1-px zero-padding border band, so this variant keeps a per-channel scaling but has no learned spatial prior (48,414 trainable params).

@@ -95,15 +95,19 @@ def load_state_dict(path):
 
 
 def infer_model_config(sd):
-    '''Recover the EGEUNet constructor arguments from state_dict shapes/keys.'''
-    c_list = [
-        int(sd['encoder1.0.weight'].shape[0]),
-        int(sd['encoder2.0.weight'].shape[0]),
-        int(sd['encoder3.0.weight'].shape[0]),
-        int(sd['encoder4.0.ldw.2.weight'].shape[0]),
-        int(sd['encoder5.0.ldw.2.weight'].shape[0]),
-        int(sd['encoder6.0.ldw.2.weight'].shape[0]),
-    ]
+    '''Recover the EGEUNet constructor arguments from state_dict shapes/keys (any GHPA placement).'''
+    c_list, ghpa_stages = [], []
+    for i in range(1, 7):
+        if f'encoder{i}.0.ldw.2.weight' in sd:      # GHPA stage (its last conv outputs the stage width)
+            c_list.append(int(sd[f'encoder{i}.0.ldw.2.weight'].shape[0]))
+            ghpa_stages.append(f'enc{i}')
+        elif f'encoder{i}.0.weight' in sd:          # plain conv stage
+            c_list.append(int(sd[f'encoder{i}.0.weight'].shape[0]))
+        else:
+            raise ValueError(f'cannot infer encoder{i} from state_dict keys')
+    for i in range(1, 6):
+        if f'decoder{i}.0.ldw.2.weight' in sd:
+            ghpa_stages.append(f'dec{i}')
     return {
         'num_classes': int(sd['final.weight'].shape[0]),
         'input_channels': int(sd['encoder1.0.weight'].shape[1]),
@@ -112,6 +116,7 @@ def infer_model_config(sd):
         'gt_ds': any(k.startswith('gt_conv1.') for k in sd),
         # frozen_ones is forward-equivalent to learnable once the weights are loaded
         'hpa_mode': 'learnable' if any(k.endswith('params_xy') for k in sd) else 'none',
+        'ghpa_stages': ghpa_stages or None,
     }
 
 
