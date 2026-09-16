@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 
 from utils import *
 from configs.config_setting import get_config
@@ -19,6 +20,20 @@ warnings.filterwarnings("ignore")
 
 METRIC_FIELDS = ['epoch', 'train_loss', 'val_loss', 'lr',
                  'miou', 'f1_or_dsc', 'accuracy', 'specificity', 'sensitivity']
+
+
+def git_revision():
+    """Branch + commit of the checked-out code, so every run records what produced it."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    def _git(*args):
+        try:
+            return subprocess.check_output(['git', '-C', repo, *args],
+                                           stderr=subprocess.DEVNULL, text=True).strip()
+        except Exception:
+            return 'unknown'
+    branch, commit = _git('rev-parse', '--abbrev-ref', 'HEAD'), _git('rev-parse', 'HEAD')
+    dirty = ' (dirty)' if _git('status', '--porcelain') not in ('', 'unknown') else ''
+    return f'{branch}@{commit[:10]}{dirty}'
 
 
 def parse_args():
@@ -70,6 +85,10 @@ def main(config):
     writer = SummaryWriter(os.path.join(config.work_dir, 'summary'))
 
     log_config_info(config, logger)
+
+    log_info = f'code revision: {git_revision()}'
+    print(log_info)
+    logger.info(log_info)
 
 
 

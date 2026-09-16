@@ -51,9 +51,25 @@ python train.py --dataset isic18 --work-dir results/my_experiment --epochs 300 -
 - `--dataset {isic17,isic18}`, `--data-path DIR`, `--epochs N`, `--batch-size N`, `--num-workers N`, `--val-interval N`, `--seed N`, `--device {cuda,cpu}` (cpu is only for local smoke tests).
 - `--hpa-mode {learnable,frozen_ones,none}` — GHPA static-prior ablation (see section 5). Default `learnable` = the original model.
 
-**3. Train on Google Colab (with results persisted to Google Drive).**
+**3. Train on a rented GPU server.**
 
-Open [colab_train.ipynb](colab_train.ipynb) in Colab, fill in the parameters cell (your repo URL, the Drive path of the dataset zip, a run name), and Run all. All outputs are written to a folder on your Drive, so nothing is lost when the session dies — re-running the notebook with the same run name resumes training from the last saved epoch.
+```
+# on the server
+git clone https://github.com/thinhvd/EGE-UNet-exp.git && cd EGE-UNet-exp
+git checkout <branch>                 # main, or the experiment branch
+bash scripts/setup_server.sh          # venv + deps + CUDA check + dataset check
+source .venv/bin/activate
+python train.py --work-dir results/egeunet_isic17_learnable_s42 [flags]
+
+# on the local machine, to pull the finished runs back
+SERVER=user@host bash scripts/sync_results.sh
+```
+
+`--work-dir` is the only thing needed for crash safety: re-running the same command after a disconnect resumes
+from `checkpoints/latest.pth`. Every run logs its `code revision: <branch>@<commit>` so results can always be
+traced back to the code that produced them.
+
+Google Colab is no longer used (since 09/2026); the old notebooks are archived in [notebooks/](notebooks/).
 
 **4. Obtain the outputs.**
 - After training, you could obtain the results in the work dir (default: './results/'): per-epoch `metrics.csv`, final `test_results.json`, checkpoints, logs, TensorBoard events and visualization images.
@@ -84,4 +100,40 @@ python analysis/compare_runs.py --group learnable=dirA,dirB,dirC --group frozen_
 - `eval_per_image.py` → `<work_dir>/analysis/per_image_metrics[_shift..][_override-..].csv/.json`: per-image DSC/IoU with lesion area, centroid offset from the image center and touches-border flag, plus the pooled metrics computed like `engine.py` (reconciles with `test_results.json`).
 - `compare_runs.py` → `<work_dir>/analysis/compare/`: mean metric per lesion-position / lesion-size tertile and group, paired differences vs the first group with bootstrap 95% CIs (and Wilcoxon p when scipy is available), and the **interaction** `diff_T1 − diff_T3` (central minus off-center) — a CI excluding 0 means the gain depends on the lesion position.
 
-*Suggested experiment matrix* (ISIC17; name runs `egeunet_{dataset}_{hpa_mode}_s{seed}`): `learnable`, `frozen_ones`, `none` with seed 42 first (3 runs; time one run on your GPU to budget), then add seeds 43 and 44 for all three if the differences are smaller than ~3× the paper's reported std (0.10 mIoU). `--gate-override spatial_mean` on the learnable checkpoint is a free first look before retraining anything. `colab_analysis.ipynb` runs the whole pipeline on Drive-stored experiments.
+*Suggested experiment matrix* (ISIC17; name runs `egeunet_{dataset}_{hpa_mode}_s{seed}`): `learnable`, `frozen_ones`, `none` with seed 42 first (3 runs; time one run on your GPU to budget), then add seeds 43 and 44 for all three if the differences are smaller than ~3× the paper's reported std (0.10 mIoU). `--gate-override spatial_mean` on the learnable checkpoint is a free first look before retraining anything.
+
+**6. Repository layout and experiment workflow.**
+
+```
+train.py engine.py utils.py           core training code (author's, kept behavior-identical)
+models/ configs/ datasets/            model, config, data loading
+models/<feature>.py                   NEW experiment modules live in their own file
+analysis/                             evaluation + interpretability tools (post-hoc, never touch training)
+scripts/                              GPU-server runbook (setup, result sync, per-experiment train scripts)
+notebooks/                            archived Colab notebooks (no longer maintained)
+results/                              run outputs (gitignored)
+data/                                 dataset (gitignored)
+```
+
+*Running the author's original code.* With no flags, `python train.py` reproduces the original training behavior
+bit-for-bit. This is not a claim of good faith but a checked invariant: at seed 0 the model's `state_dict` hashes
+to `87b3dec8b84590308c5f527402db3e9ebabf0159634d35da5a62c7753ac6737f` (314 keys, 53,374 params), a fixed input
+sums to `77392.56237548799` through the forward pass, and one AdamW step gives loss `10.317150115966797`. Any
+change that shifts those numbers is a bug in the change, not a new baseline. Known bugs of the original
+(fixed-angle random rotation, BCE on probabilities, the no-op normalization) are deliberately preserved.
+
+The author's untouched code is kept on the `author-original` branch (frozen at upstream
+[JCruan519/EGE-UNet](https://github.com/JCruan519/EGE-UNet) `f52ba30`, tag `author-original-f52ba30`) for diffing
+and auditing — `git diff author-original main -- models/egeunet.py`. It is a reference, not a runnable target:
+as published it is missing the package `__init__.py` files and pins dependencies that no longer install cleanly.
+
+*Branches.* `main` holds the faithful baseline plus shared infrastructure (CLI, analysis tools, scripts). Each
+experiment gets its own branch, `exp/NN-short-name` (e.g. `exp/04-cross-stage-fusion`), so an old experiment can
+be re-run exactly by checking out its branch. Infrastructure that proves generally useful is merged back to
+`main` after the experiment concludes; the experimental model code stays on its branch.
+
+*Adding an experiment.* Put new model code in its own module (e.g. `models/fusion.py`), wire it into
+`models/egeunet.py` behind a constructor flag that defaults to off, and expose it as a CLI flag in `train.py` +
+`configs/config_setting.py` (the `--hpa-mode` / `--ghpa-placement` flags are the pattern to copy). The default
+path must stay on the oracle numbers above. Every experiment also gets a Vietnamese write-up in `exp_docs/`
+(local only) with its predictions registered before the runs start.

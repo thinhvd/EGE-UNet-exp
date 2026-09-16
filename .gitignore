@@ -12,3 +12,7 @@ data/*
 !data/readme.md
 
 pre_trained/
+
+# experiment notes and reports (local only)
+exp_docs/
+reports/
