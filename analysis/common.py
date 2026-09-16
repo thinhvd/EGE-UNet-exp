@@ -117,6 +117,25 @@ def infer_model_config(sd):
         # frozen_ones is forward-equivalent to learnable once the weights are loaded
         'hpa_mode': 'learnable' if any(k.endswith('params_xy') for k in sd) else 'none',
         'ghpa_stages': ghpa_stages or None,
+        **_infer_fusion_config(sd),
+    }
+
+
+def _infer_fusion_config(sd):
+    '''EXP-4: recover the cross-stage fusion arguments (models/fusion.py) from the checkpoint keys.'''
+    if not any(k.startswith('fusion.') for k in sd):
+        return {'fusion_mode': 'none', 'fusion_stages': None, 'fusion_dim': 16}
+    if any(k.startswith('fusion.attn.') for k in sd):
+        mode = 'csaa'
+    elif any(k.startswith('fusion.sum_w.') for k in sd):
+        mode = 'sum'
+    else:
+        mode = 'concat'
+    stages = [f'dec{i}' for i in range(1, 6) if f'fusion.heads.dec{i}.weight' in sd]
+    return {
+        'fusion_mode': mode,
+        'fusion_stages': stages,
+        'fusion_dim': int(sd['fusion.proj.0.0.weight'].shape[0]),
     }
 
 

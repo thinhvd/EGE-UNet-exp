@@ -66,6 +66,16 @@ def parse_args():
     parser.add_argument('--ghpa-stages', type=str, default=None,
                         help='free-form comma list of GHPA stages, e.g. "enc3,enc4,enc5,dec2,dec3,dec4" '
                              '(overrides --ghpa-placement)')
+    parser.add_argument('--fusion', type=str, default=None, choices=['none', 'sum', 'concat', 'csaa'],
+                        help='EXP-4 cross-stage fusion feeding decoder stages a fused view of all five '
+                             'encoder stages: none (original), sum / concat (controls without attention), '
+                             'csaa (concat + cross-stage axial attention). Default: config value (none)')
+    parser.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5'],
+                        help='which decoder stages receive the fused feature (see models.fusion.'
+                             'FUSION_STAGE_SETS); deep3 = dec1/2/3, all5 = every decoder stage')
+    parser.add_argument('--fusion-dim', type=int, default=None,
+                        help='common channel width the encoder stages are projected to before fusion '
+                             '(must be divisible by 4; default 16)')
     return parser.parse_args()
 
 
@@ -133,13 +143,18 @@ def main(config):
                         gt_ds=model_cfg['gt_ds'],
                         hpa_mode=model_cfg.get('hpa_mode', 'learnable'),
                         ghpa_stages=model_cfg.get('ghpa_stages'),
+                        fusion_mode=model_cfg.get('fusion_mode', 'none'),
+                        fusion_stages=model_cfg.get('fusion_stages'),
+                        fusion_dim=model_cfg.get('fusion_dim', 16),
                         )
     else: raise Exception('network in not right!')
     model = model.to(config.device)
     n_total = sum(p.numel() for p in model.parameters())
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log_info = (f'hpa_mode: {model_cfg.get("hpa_mode", "learnable")}, '
-                f'ghpa_stages: {model.ghpa_stages}, params: {n_total} total / {n_trainable} trainable')
+                f'ghpa_stages: {model.ghpa_stages}, '
+                f'fusion: {model.fusion_mode}/{model.fusion_stages}/d{model_cfg.get("fusion_dim", 16)}, '
+                f'params: {n_total} total / {n_trainable} trainable')
     print(log_info)
     logger.info(log_info)
 
@@ -172,7 +187,8 @@ def main(config):
             model.load_state_dict(checkpoint['model_state_dict'])
         except RuntimeError as e:
             raise RuntimeError(f'{resume_model} was trained with a different model config '
-                               f'(e.g. --hpa-mode / c_list). Use a new --work-dir or pass --no-resume.') from e
+                               f'(e.g. --hpa-mode / --fusion / c_list). Use a new --work-dir or '
+                               f'pass --no-resume.') from e
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         saved_epoch = checkpoint['epoch']

@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
 import math
 
+from models.fusion import CrossStageFusion, FUSION_MODES, FUSION_STAGE_SETS
+
 
 class DepthWiseConv2d(nn.Module):
     def __init__(self, dim_in, dim_out, kernel_size=3, padding=1, stride=1, dilation=1):
@@ -189,7 +191,8 @@ class Grouped_multi_axis_Hadamard_Product_Attention(nn.Module):
 class EGEUNet(nn.Module):
     
     def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True,
-                 hpa_mode='learnable', ghpa_stages=None):
+                 hpa_mode='learnable', ghpa_stages=None,
+                 fusion_mode='none', fusion_stages=None, fusion_dim=16):
         super().__init__()
 
         self.bridge = bridge
@@ -266,7 +269,26 @@ class EGEUNet(nn.Module):
 
         self.final = nn.Conv2d(c_list[0], num_classes, kernel_size=1)
 
+        if fusion_mode not in FUSION_MODES:
+            raise ValueError(f'fusion_mode must be one of {FUSION_MODES}, got {fusion_mode!r}')
+        self.fusion_mode = fusion_mode
+        self.fusion_stages = None
+
         self.apply(self._init_weights)
+
+        # EXP-4 cross-stage fusion (models/fusion.py). Built AFTER apply() on purpose: everything
+        # above then consumes the RNG exactly as in the original code — both in the constructors
+        # and in apply()'s re-draws — so the default path stays bit-identical whatever this block
+        # does. The fusion gets the same initialization by hand, and its heads are then zeroed so
+        # the variant starts from the baseline function itself, not merely near it.
+        if fusion_mode != 'none':
+            if fusion_stages is None:
+                fusion_stages = FUSION_STAGE_SETS['deep3']
+            self.fusion = CrossStageFusion(c_list, fusion_mode, fusion_stages, fdim=fusion_dim)
+            self.fusion.apply(self._init_weights)
+            self.fusion.zero_init_heads()
+            self.fusion_stages = self.fusion.target_stages
+            print(f'cross-stage fusion = {fusion_mode} on {self.fusion_stages} (dim {fusion_dim})')
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -302,7 +324,12 @@ class EGEUNet(nn.Module):
         
         out = F.gelu(self.encoder6(out)) # b, c5, H/32, W/32
         t6 = out
-        
+
+        # EXP-4: computed here because the GAB bridges below overwrite t1..t5 in place. The fused
+        # features are added AFTER each stage's gt_pre is taken, so deep supervision keeps reading
+        # exactly what it read in the baseline.
+        fuse = self.fusion((t1, t2, t3, t4, t5)) if self.fusion_mode != 'none' else {}
+
         out5 = F.gelu(self.dbn1(self.decoder1(out))) # b, c4, H/32, W/32
         if self.gt_ds: 
             gt_pre5 = self.gt_conv1(out5)
@@ -310,6 +337,7 @@ class EGEUNet(nn.Module):
             gt_pre5 = F.interpolate(gt_pre5, scale_factor=32, mode ='bilinear', align_corners=True)
         else: t5 = self.GAB5(t6, t5)
         out5 = torch.add(out5, t5) # b, c4, H/32, W/32
+        if 'dec1' in fuse: out5 = out5 + fuse['dec1']
         
         out4 = F.gelu(F.interpolate(self.dbn2(self.decoder2(out5)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c3, H/16, W/16
         if self.gt_ds: 
@@ -318,6 +346,7 @@ class EGEUNet(nn.Module):
             gt_pre4 = F.interpolate(gt_pre4, scale_factor=16, mode ='bilinear', align_corners=True)
         else:t4 = self.GAB4(t5, t4)
         out4 = torch.add(out4, t4) # b, c3, H/16, W/16
+        if 'dec2' in fuse: out4 = out4 + fuse['dec2']
         
         out3 = F.gelu(F.interpolate(self.dbn3(self.decoder3(out4)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c2, H/8, W/8
         if self.gt_ds: 
@@ -326,6 +355,7 @@ class EGEUNet(nn.Module):
             gt_pre3 = F.interpolate(gt_pre3, scale_factor=8, mode ='bilinear', align_corners=True)
         else: t3 = self.GAB3(t4, t3)
         out3 = torch.add(out3, t3) # b, c2, H/8, W/8
+        if 'dec3' in fuse: out3 = out3 + fuse['dec3']
         
         out2 = F.gelu(F.interpolate(self.dbn4(self.decoder4(out3)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c1, H/4, W/4
         if self.gt_ds: 
@@ -333,7 +363,8 @@ class EGEUNet(nn.Module):
             t2 = self.GAB2(t3, t2, gt_pre2)
             gt_pre2 = F.interpolate(gt_pre2, scale_factor=4, mode ='bilinear', align_corners=True)
         else: t2 = self.GAB2(t3, t2)
-        out2 = torch.add(out2, t2) # b, c1, H/4, W/4 
+        out2 = torch.add(out2, t2) # b, c1, H/4, W/4
+        if 'dec4' in fuse: out2 = out2 + fuse['dec4']
         
         out1 = F.gelu(F.interpolate(self.dbn5(self.decoder5(out2)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c0, H/2, W/2
         if self.gt_ds: 
@@ -342,6 +373,7 @@ class EGEUNet(nn.Module):
             gt_pre1 = F.interpolate(gt_pre1, scale_factor=2, mode ='bilinear', align_corners=True)
         else: t1 = self.GAB1(t2, t1)
         out1 = torch.add(out1, t1) # b, c0, H/2, W/2
+        if 'dec5' in fuse: out1 = out1 + fuse['dec5']
         
         out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
         

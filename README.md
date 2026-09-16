@@ -102,6 +102,25 @@ python analysis/compare_runs.py --group learnable=dirA,dirB,dirC --group frozen_
 
 *Suggested experiment matrix* (ISIC17; name runs `egeunet_{dataset}_{hpa_mode}_s{seed}`): `learnable`, `frozen_ones`, `none` with seed 42 first (3 runs; time one run on your GPU to budget), then add seeds 43 and 44 for all three if the differences are smaller than ~3× the paper's reported std (0.10 mIoU). `--gate-override spatial_mean` on the learnable checkpoint is a free first look before retraining anything.
 
+**5b. EXP-4: cross-stage fusion for the decoder (this branch).**
+
+`--fusion {none,sum,concat,csaa}` gives every chosen decoder stage a fused view of ALL five encoder
+stages instead of only its own skip connection, following EFCNet's CSAA. `--fusion-stages
+{deep3,all5}` picks which decoder stages receive it (deep3 = dec1/2/3, the stages where GHPA
+operates) and `--fusion-dim` (default 16) sets the common channel width. `sum` and `concat` are the
+controls that carry the multi-scale information without any attention; `csaa` adds a two-step axial
+attention as a pure additive term on top of `concat`, so the two differ by exactly the attention and
+1,632 parameters. Implementation in [models/fusion.py](models/fusion.py).
+
+Every head is zero-initialized, so at init all six variants are bitwise identical to the baseline —
+verified, together with the oracle constants, before any run. Parameter counts: sum-deep3 57,445 /
+sum-all5 57,863 / concat-deep3 64,086 / concat-all5 66,030 / csaa-deep3 65,718 / csaa-all5 67,662.
+The run matrix is in [scripts/exp04_train.sh](scripts/exp04_train.sh).
+
+`analysis/benchmark_speed.py` reports parameters, MACs and measured latency for any variant (from a
+checkpoint or straight from flags). Note the units: the paper's "0.072 GFLOPs" is the GMACs column
+here (the thop convention of labelling MACs as FLOPs); the baseline measures 0.0721 GMACs.
+
 **6. Repository layout and experiment workflow.**
 
 ```

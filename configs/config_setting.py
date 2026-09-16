@@ -17,6 +17,9 @@ class setting_config:
         'gt_ds': True,
         'hpa_mode': 'learnable',  # GHPA static-prior ablation: 'learnable' (original) | 'frozen_ones' | 'none'
         'ghpa_stages': None,      # None = original placement; see models.egeunet.GHPA_PLACEMENTS ('low'/'mid'/'high')
+        'fusion_mode': 'none',    # EXP-4 cross-stage fusion: 'none' (original) | 'sum' | 'concat' | 'csaa'
+        'fusion_stages': None,    # None = deep3 when fusion is on; see models.fusion.FUSION_STAGE_SETS
+        'fusion_dim': 16,         # common channel width of the fused features
     }
 
     datasets = 'isic17'
@@ -202,6 +205,16 @@ def get_config(args=None):
     elif placement is not None:
         from models.egeunet import GHPA_PLACEMENTS
         config.model_config['ghpa_stages'] = GHPA_PLACEMENTS[placement]
+    fusion = getattr(args, 'fusion', None)
+    if fusion is not None:
+        config.model_config['fusion_mode'] = fusion
+    fusion_stages = getattr(args, 'fusion_stages', None)
+    if fusion_stages is not None:
+        from models.fusion import FUSION_STAGE_SETS
+        config.model_config['fusion_stages'] = FUSION_STAGE_SETS[fusion_stages]
+    fusion_dim = getattr(args, 'fusion_dim', None)
+    if fusion_dim is not None:
+        config.model_config['fusion_dim'] = fusion_dim
     config.device = args.device
     config.no_resume = args.no_resume
     return config
