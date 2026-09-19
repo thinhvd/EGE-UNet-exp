@@ -16,3 +16,6 @@ pre_trained/
 # experiment notes and reports (local only)
 exp_docs/
 reports/
+
+# stamp written by scripts/push_code.sh for the training server
+.code_revision

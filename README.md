@@ -54,20 +54,29 @@ python train.py --dataset isic18 --work-dir results/my_experiment --epochs 300 -
 **3. Train on a rented GPU server.**
 
 ```
+# from the local machine: push the code (git stays local; the server needs no clone)
+SERVER=<user>@<host> PORT=<port> bash scripts/push_code.sh
+
 # on the server
-git clone https://github.com/thinhvd/EGE-UNet-exp.git && cd EGE-UNet-exp
-git checkout <branch>                 # main, or the experiment branch
-bash scripts/setup_server.sh          # venv + deps + CUDA check + dataset check
-source .venv/bin/activate
+bash scripts/setup_server.sh          # deps + CUDA check + dataset check
 python train.py --work-dir results/egeunet_isic17_learnable_s42 [flags]
 
 # on the local machine, to pull the finished runs back
-SERVER=user@host bash scripts/sync_results.sh
+SERVER=<user>@<host> PORT=<port> LEAN=1 bash scripts/sync_results.sh
 ```
+
+The dataset is pushed once, and only the subset in use: `isic2017` is 29 MB (`isic2018` is 251 MB).
+`push_code.sh` also writes a `.code_revision` stamp so a server without `.git` still records in each
+run's log which commit produced it.
 
 `--work-dir` is the only thing needed for crash safety: re-running the same command after a disconnect resumes
 from `checkpoints/latest.pth`. Every run logs its `code revision: <branch>@<commit>` so results can always be
-traced back to the code that produced them.
+traced back to the code that produced them. Launch long runs detached (`setsid nohup … &`, as
+`PARALLEL=1 scripts/exp04_train.sh` does) — an SSH drop must not take the training with it.
+
+Results are only comparable within one environment. Different GPUs and PyTorch builds give numerically
+different forward passes even from identical weights, and 300 epochs amplify that, so a new experiment
+retrains its own baselines on the same machine rather than reusing numbers from an earlier setup.
 
 Google Colab is no longer used (since 09/2026); the old notebooks are archived in [notebooks/](notebooks/).
 

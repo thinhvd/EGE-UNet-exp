@@ -23,7 +23,11 @@ METRIC_FIELDS = ['epoch', 'train_loss', 'val_loss', 'lr',
 
 
 def git_revision():
-    """Branch + commit of the checked-out code, so every run records what produced it."""
+    """Branch + commit of the code, so every run records what produced it.
+
+    A training server gets the code by rsync and has no .git, so fall back to the `.code_revision`
+    file that scripts/push_code.sh writes at sync time.
+    """
     repo = os.path.dirname(os.path.abspath(__file__))
     def _git(*args):
         try:
@@ -32,6 +36,15 @@ def git_revision():
         except Exception:
             return 'unknown'
     branch, commit = _git('rev-parse', '--abbrev-ref', 'HEAD'), _git('rev-parse', 'HEAD')
+    if 'unknown' in (branch, commit):
+        stamp = os.path.join(repo, '.code_revision')
+        if os.path.isfile(stamp):
+            try:
+                with open(stamp) as f:
+                    return f.read().strip() + ' (from .code_revision)'
+            except Exception:
+                pass
+        return 'unknown'
     dirty = ' (dirty)' if _git('status', '--porcelain') not in ('', 'unknown') else ''
     return f'{branch}@{commit[:10]}{dirty}'
 
