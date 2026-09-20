@@ -11,7 +11,9 @@
 # The link to a rented box can be slow and drop mid-transfer, so rsync runs with --partial inside a
 # retry loop: re-running resumes rather than restarting. LEAN=1 fetches only what the analysis
 # pipeline reads (best-*.pth, metrics.csv, test_results.json, log/) - about 0.5 MB per run instead
-# of 5 MB - and is the right choice on a slow link.
+# of 5 MB - and is the project's convention: the best weights are enough for inference and for
+# finetuning. What it leaves on the server is latest.pth (optimizer and scheduler state, only needed
+# to resume the exact run) and the TensorBoard events; both are gone once the rented box is returned.
 set -euo pipefail
 
 SERVER=${SERVER:-}                                   # user@host  (required)

@@ -79,10 +79,12 @@ def parse_args():
     parser.add_argument('--ghpa-stages', type=str, default=None,
                         help='free-form comma list of GHPA stages, e.g. "enc3,enc4,enc5,dec2,dec3,dec4" '
                              '(overrides --ghpa-placement)')
-    parser.add_argument('--fusion', type=str, default=None, choices=['none', 'sum', 'concat', 'csaa'],
+    parser.add_argument('--fusion', type=str, default=None,
+                        choices=['none', 'sum', 'concat', 'csaa', 'sum_attn'],
                         help='EXP-4 cross-stage fusion feeding decoder stages a fused view of all five '
                              'encoder stages: none (original), sum / concat (controls without attention), '
-                             'csaa (concat + cross-stage axial attention). Default: config value (none)')
+                             'csaa (concat + cross-stage axial attention), sum_attn (sum + the same '
+                             'attention). Default: config value (none)')
     parser.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5'],
                         help='which decoder stages receive the fused feature (see models.fusion.'
                              'FUSION_STAGE_SETS); deep3 = dec1/2/3, all5 = every decoder stage')

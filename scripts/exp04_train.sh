@@ -18,15 +18,16 @@
 #  4  fuse-sum-all5                57863   control, every decoder stage
 #  5  fuse-csaa-deep3              65718   concat + cross-stage attention (+1632 params)
 #  6  fuse-csaa-all5               67662   the same, on every decoder stage
+#  7  fuse-sum_attn-deep3          59077   sum + the same attention (+1632 params over run 1)
+#  8  fuse-sum_attn-all5           59495   the same, on every decoder stage (+1632 over run 4)
 #
-# WHY THE BASELINES ARE RETRAINED HERE. The EXP-1..3 numbers (learnable 80.35 mIoU, none 78.17)
-# come from Colab T4 with an older PyTorch. This machine has a different GPU and a different torch
-# build, and the two disagree in floating-point detail: the same seed-0 model produces a forward sum
-# of 77392.56770953648 here versus 77392.56237548799 there (same weights, same code - a ~7e-8
-# relative difference from different kernels). Over 300 epochs that grows chaotically, so comparing
-# a fusion run trained here against a baseline trained there would mix the fusion effect with an
-# environment effect. Retraining both baselines in this environment costs two runs and makes every
-# comparison within-environment.
+# WHY THE BASELINES WERE RETRAINED. The EXP-1..3 numbers (learnable 80.35 mIoU, none 78.17) come from
+# earlier runs. No run of this code is reproducible, though - not across machines and not on one
+# machine: the augmentation's rotation angle is drawn at import time, before set_seed, so each run
+# trains with its own angle, and CUDA backward kernels are nondeterministic (see README section 6).
+# Retraining the baselines alongside the variants gives them the same protocol and batch; it does
+# not make any single comparison exact. The retrained learnable landed at 79.37, about 1 mIoU from
+# the earlier 80.35 - the run-to-run spread to keep in mind when reading single-run gaps.
 #
 # CHECK AT THE START OF EVERY RUN: the log line must read the params count from the table above.
 # "params: 53374" on a fusion run means the flags did not reach the model.
@@ -62,6 +63,8 @@ RUNS=(
     "4|learnable|sum|all5|57863"
     "5|learnable|csaa|deep3|65718"
     "6|learnable|csaa|all5|67662"
+    "7|learnable|sum_attn|deep3|59077"
+    "8|learnable|sum_attn|all5|59495"
 )
 
 WANTED=("$@")
@@ -118,7 +121,9 @@ python analysis/benchmark_speed.py --device cuda --out results/benchmark_gpu.jso
     --checkpoint results/egeunet_isic17_learnable_fuse-concat-deep3_s42 --label concat-deep3 \
     --checkpoint results/egeunet_isic17_learnable_fuse-concat-all5_s42  --label concat-all5 \
     --checkpoint results/egeunet_isic17_learnable_fuse-csaa-deep3_s42   --label csaa-deep3 \
-    --checkpoint results/egeunet_isic17_learnable_fuse-csaa-all5_s42    --label csaa-all5
+    --checkpoint results/egeunet_isic17_learnable_fuse-csaa-all5_s42    --label csaa-all5 \
+    --checkpoint results/egeunet_isic17_learnable_fuse-sum_attn-deep3_s42 --label sum_attn-deep3 \
+    --checkpoint results/egeunet_isic17_learnable_fuse-sum_attn-all5_s42  --label sum_attn-all5
 
 # then pull everything to the local machine and analyse there:
 #   SERVER=user@host bash scripts/sync_results.sh

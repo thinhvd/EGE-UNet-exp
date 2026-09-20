@@ -164,7 +164,7 @@ def main():
     ap.add_argument('--label', action='append', default=[],
                     help='name for the corresponding --checkpoint (defaults to the folder name)')
     ap.add_argument('--hpa-mode', type=str, default='learnable', choices=['learnable', 'frozen_ones', 'none'])
-    ap.add_argument('--fusion', type=str, default='none', choices=['none', 'sum', 'concat', 'csaa'])
+    ap.add_argument('--fusion', type=str, default='none', choices=['none', 'sum', 'concat', 'csaa', 'sum_attn'])
     ap.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5'])
     ap.add_argument('--fusion-dim', type=int, default=16)
     ap.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])

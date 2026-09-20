@@ -7,18 +7,24 @@ its skip connection carries, so fine-scale evidence never reaches the deep stage
 operates. EFCNet's CSAA module attacks exactly that by letting every decoder stage read a fused
 view of ALL encoder stages.
 
-This module implements three fusion variants that share one code path, so they differ only in the
-one ingredient under test:
+This module implements the fusion variants on one code path, so they differ only in the ingredient
+under test. Each mode is a choice of how the five maps are combined (sum or concat) and whether the
+cross-stage attention runs first:
 
-    'sum'    - resize the 5 projected encoder maps to the target grid and take a learned weighted
-               sum. Control: it adds an extra path into the decoder with almost no capacity and no
-               cross-scale mixing beyond a per-source scalar.
-    'concat' - concatenate the 5 resized maps and mix them with a 1x1 conv. Control: full linear
-               cross-scale mixing, still no attention.
-    'csaa'   - 'concat' plus a two-step axial attention over the stacked stages (EFCNet's CSAA,
-               shrunk to a small common channel width). Because the attention is applied as an
-               additive delta on the projections, 'csaa' and 'concat' differ by exactly the
-               attention term (and 1,632 parameters) and by nothing else.
+    'sum'      - resize the 5 projected encoder maps to the target grid and take a learned weighted
+                 sum. Control: it adds an extra path into the decoder with almost no capacity and no
+                 cross-scale mixing beyond a per-source scalar.
+    'concat'   - concatenate the 5 resized maps and mix them with a 1x1 conv. Control: full linear
+                 cross-scale mixing, still no attention.
+    'csaa'     - 'concat' plus a two-step axial attention over the stacked stages (EFCNet's CSAA,
+                 shrunk to a small common channel width).
+    'sum_attn' - 'sum' plus the same attention. With 'sum' the combine step is a fixed scalar per
+                 source, so the attention is the only input-dependent interaction between stages;
+                 'sum' vs 'sum_attn' isolates what the attention contributes more sharply than
+                 'concat' vs 'csaa', where the 1x1 conv already mixes the stages.
+
+The attention is applied as an additive delta on the projections, so each attention variant differs
+from its control by exactly the attention term (and 1,632 parameters) and by nothing else.
 
 Init-equivalence. Every per-stage head is zero-initialized (weight and bias), so at initialization
 the fusion contributes exactly 0 and the whole network is bitwise identical to the baseline for the
@@ -31,7 +37,9 @@ from torch import nn
 import torch.nn.functional as F
 
 
-FUSION_MODES = ('none', 'sum', 'concat', 'csaa')
+FUSION_MODES = ('none', 'sum', 'concat', 'csaa', 'sum_attn')
+_SUM_COMBINE = ('sum', 'sum_attn')
+_WITH_ATTENTION = ('csaa', 'sum_attn')
 
 # Which decoder stages receive the fused feature. dec1..dec5 are the decoder outputs out5..out1,
 # i.e. dec1 is the deepest (8x8 with a 256x256 input) and dec5 the shallowest (128x128).
@@ -112,7 +120,7 @@ class CrossStageFusion(nn.Module):
         target_stages: decoder stages to feed, e.g. FUSION_STAGE_SETS['deep3'].
         fdim: common channel width the sources are projected to (must be divisible by 4 for
             GroupNorm(4)). This is the reduction ratio under test in the attention variant.
-        common_grid: spatial size the attention runs on (csaa only).
+        common_grid: spatial size the attention runs on (attention variants only).
     """
 
     def __init__(self, c_list, mode, target_stages, fdim=16, common_grid=16):
@@ -129,27 +137,31 @@ class CrossStageFusion(nn.Module):
             raise ValueError('fusion needs at least one target stage')
 
         self.mode = mode
+        self.combine = 'sum' if mode in _SUM_COMBINE else 'concat'
+        self.use_attn = mode in _WITH_ATTENTION
         self.fdim = fdim
         self.common_grid = common_grid
         self.target_stages = target_stages
         self.n_src = 5
 
+        # registration order (proj, attn, sum_w, heads) fixes both the RNG draws and the state_dict
+        # keys; keep it, or checkpoints trained before 'sum_attn' existed stop meaning the same thing
         self.proj = nn.ModuleList([
             nn.Sequential(nn.Conv2d(c_list[i], fdim, 1), nn.GroupNorm(4, fdim), nn.GELU())
             for i in range(self.n_src)
         ])
 
-        if mode == 'csaa':
+        if self.use_attn:
             self.attn = CrossStageAxialAttention(fdim=fdim, grid=common_grid)
 
-        if mode == 'sum':
+        if self.combine == 'sum':
             # one scalar per source per target stage; plain (no softmax) - the zero-init head
             # already guarantees init-equivalence, so these weights need no special handling.
             self.sum_w = nn.ParameterDict({
                 s: nn.Parameter(torch.full((self.n_src,), 1.0 / self.n_src)) for s in target_stages
             })
 
-        head_in = fdim if mode == 'sum' else self.n_src * fdim
+        head_in = fdim if self.combine == 'sum' else self.n_src * fdim
         self.heads = nn.ModuleDict({
             s: nn.Conv2d(head_in, c_list[_STAGE_SOURCE_IDX[s]], 1) for s in target_stages
         })
@@ -172,7 +184,7 @@ class CrossStageFusion(nn.Module):
         """
         p = [self.proj[i](feats[i]) for i in range(self.n_src)]
 
-        if self.mode == 'csaa':
+        if self.use_attn:
             g = self.common_grid
             stacked = torch.stack([
                 F.interpolate(f, size=(g, g), mode='bilinear', align_corners=True) for f in p
@@ -187,7 +199,7 @@ class CrossStageFusion(nn.Module):
             resized = [f if f.shape[2:4] == size
                        else F.interpolate(f, size=size, mode='bilinear', align_corners=True)
                        for f in p]
-            if self.mode == 'sum':
+            if self.combine == 'sum':
                 w = self.sum_w[s]
                 fused = sum(w[i] * resized[i] for i in range(self.n_src))
             else:

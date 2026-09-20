@@ -125,12 +125,10 @@ def _infer_fusion_config(sd):
     '''EXP-4: recover the cross-stage fusion arguments (models/fusion.py) from the checkpoint keys.'''
     if not any(k.startswith('fusion.') for k in sd):
         return {'fusion_mode': 'none', 'fusion_stages': None, 'fusion_dim': 16}
-    if any(k.startswith('fusion.attn.') for k in sd):
-        mode = 'csaa'
-    elif any(k.startswith('fusion.sum_w.') for k in sd):
-        mode = 'sum'
-    else:
-        mode = 'concat'
+    has_attn = any(k.startswith('fusion.attn.') for k in sd)
+    has_sum = any(k.startswith('fusion.sum_w.') for k in sd)
+    mode = {(True, True): 'sum_attn', (True, False): 'csaa',
+            (False, True): 'sum', (False, False): 'concat'}[(has_attn, has_sum)]
     stages = [f'dec{i}' for i in range(1, 6) if f'fusion.heads.dec{i}.weight' in sd]
     return {
         'fusion_mode': mode,

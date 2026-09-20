@@ -26,6 +26,8 @@ RUNS=(
     "concat-all5|egeunet_${DATASET}_learnable_fuse-concat-all5_s${SEED}"
     "csaa-deep3|egeunet_${DATASET}_learnable_fuse-csaa-deep3_s${SEED}"
     "csaa-all5|egeunet_${DATASET}_learnable_fuse-csaa-all5_s${SEED}"
+    "sum_attn-deep3|egeunet_${DATASET}_learnable_fuse-sum_attn-deep3_s${SEED}"
+    "sum_attn-all5|egeunet_${DATASET}_learnable_fuse-sum_attn-all5_s${SEED}"
 )
 
 echo "#---------- per-image metrics ----------#"

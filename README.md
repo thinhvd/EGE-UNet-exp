@@ -62,7 +62,7 @@ bash scripts/setup_server.sh          # deps + CUDA check + dataset check
 python train.py --work-dir results/egeunet_isic17_learnable_s42 [flags]
 
 # on the local machine, to pull the finished runs back
-SERVER=<user>@<host> PORT=<port> LEAN=1 bash scripts/sync_results.sh
+SERVER=<user>@<host> PORT=<port> LEAN=1 bash scripts/sync_results.sh   # best checkpoint only (project convention)
 ```
 
 The dataset is pushed once, and only the subset in use: `isic2017` is 29 MB (`isic2018` is 251 MB).
@@ -74,9 +74,9 @@ from `checkpoints/latest.pth`. Every run logs its `code revision: <branch>@<comm
 traced back to the code that produced them. Launch long runs detached (`setsid nohup … &`, as
 `PARALLEL=1 scripts/exp04_train.sh` does) — an SSH drop must not take the training with it.
 
-Results are only comparable within one environment. Different GPUs and PyTorch builds give numerically
-different forward passes even from identical weights, and 300 epochs amplify that, so a new experiment
-retrains its own baselines on the same machine rather than reusing numbers from an earlier setup.
+Every training run is a random draw, even on the same machine with the same seed (see *Training is not
+reproducible run to run* in section 6), so a gap between two single runs below about 1 mIoU is not evidence of
+anything.
 
 Google Colab is no longer used (since 09/2026); the old notebooks are archived in [notebooks/](notebooks/).
 
@@ -143,12 +143,22 @@ results/                              run outputs (gitignored)
 data/                                 dataset (gitignored)
 ```
 
-*Running the author's original code.* With no flags, `python train.py` reproduces the original training behavior
-bit-for-bit. This is not a claim of good faith but a checked invariant: at seed 0 the model's `state_dict` hashes
-to `87b3dec8b84590308c5f527402db3e9ebabf0159634d35da5a62c7753ac6737f` (314 keys, 53,374 params), a fixed input
-sums to `77392.56237548799` through the forward pass, and one AdamW step gives loss `10.317150115966797`. Any
-change that shifts those numbers is a bug in the change, not a new baseline. Known bugs of the original
-(fixed-angle random rotation, BCE on probabilities, the no-op normalization) are deliberately preserved.
+*Running the author's original code.* With no flags, `python train.py` runs exactly the original computation.
+This is not a claim of good faith but a checked invariant: at seed 0 the model's `state_dict` hashes to
+`87b3dec8b84590308c5f527402db3e9ebabf0159634d35da5a62c7753ac6737f` (314 keys, 53,374 params) and one AdamW step
+gives loss `10.317150115966797`, on every machine tested so far. The forward sum of a fixed input is recorded too,
+but it depends on the CPU and PyTorch build (`77392.56237548799` on the original Colab torch and on a local CPU,
+`77392.56770953648` and `77392.55116900953` on two rented GPU boxes), so compare it only before and after a
+change on the same machine. Any change that shifts these numbers is a bug in the change, not a new baseline.
+Known bugs of the original (fixed-angle random rotation, BCE on probabilities, the no-op normalization) are
+deliberately preserved.
+
+*Training is not reproducible run to run - in the original code, and therefore here.* The augmentation's
+rotation angle is drawn once, when the transforms are built at import time, which is before `set_seed` runs;
+every run therefore trains with a different angle, whatever the seed. On top of that, CUDA backward kernels are
+nondeterministic. Two runs of the same command on the same machine already differ at the first iteration, and the
+same configuration has been measured about 1 mIoU apart between runs. Read single-run gaps below that as noise.
+Fixing either source would change the original behavior, so both are left as they are.
 
 The author's untouched code is kept on the `author-original` branch (frozen at upstream
 [JCruan519/EGE-UNet](https://github.com/JCruan519/EGE-UNet) `f52ba30`, tag `author-original-f52ba30`) for diffing
