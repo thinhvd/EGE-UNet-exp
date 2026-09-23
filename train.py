@@ -172,6 +172,13 @@ def main(config):
                 f'params: {n_total} total / {n_trainable} trainable')
     print(log_info)
     logger.info(log_info)
+    # EXP-5: record the run's rotation angle (reading an attribute consumes no randomness).
+    # Goes through logger so it lives in log/train.info.log, which survives the LEAN sync.
+    rot = [t for t in config.train_transformer.transforms if isinstance(t, myRandomRotation)]
+    log_info = (f'rotation angle: {rot[0].angle!r} (seed {rot[0].seed})' if rot
+                else 'rotation angle: n/a')
+    print(log_info)
+    logger.info(log_info)
 
 
 

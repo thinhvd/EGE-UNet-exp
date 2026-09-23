@@ -158,7 +158,16 @@ rotation angle is drawn once, when the transforms are built at import time, whic
 every run therefore trains with a different angle, whatever the seed. On top of that, CUDA backward kernels are
 nondeterministic. Two runs of the same command on the same machine already differ at the first iteration, and the
 same configuration has been measured about 1 mIoU apart between runs. Read single-run gaps below that as noise.
-Fixing either source would change the original behavior, so both are left as they are.
+Fixing either source would change the original behavior, so both are left as they are on `main`.
+
+*On this branch (`exp/05-seeded-rotation-isic1718`) the rotation angle is a function of `--seed`:*
+`myRandomRotation` draws its single angle from a private `random.Random(seed)`, so every run with seed 42 rotates
+by `230.19364744483815` degrees and the angle is written to the log (`rotation angle: ...`). The private generator
+touches neither the global python RNG nor torch's, so model initialization and the per-sample flip/rotate coins
+are exactly what they are on `main` (checked: identical seed-0 `state_dict` and identical post-`set_seed` draws
+before and after building the transforms). CUDA nondeterminism remains, and cannot be removed for this model:
+`torch.use_deterministic_algorithms(True)` raises on the backward of bilinear `F.interpolate`, which the network
+uses 17 times. Runs on this branch are therefore still single draws, only with one nuisance source fewer.
 
 The author's untouched code is kept on the `author-original` branch (frozen at upstream
 [JCruan519/EGE-UNet](https://github.com/JCruan519/EGE-UNet) `f52ba30`, tag `author-original-f52ba30`) for diffing

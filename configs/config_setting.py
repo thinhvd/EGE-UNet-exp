@@ -150,14 +150,17 @@ class setting_config:
 
 def build_transforms(config):
     '''
-    (Re)build the dataset-dependent transform pipelines from config.datasets and the input size.
+    (Re)build the transform pipelines from config.datasets, the input size and (EXP-5) the seed:
+    the single rotation angle of the run is drawn from a private generator seeded with
+    config.seed, so it is a function of the seed instead of an OS-random draw at import time.
+    Nothing here touches the global python/torch rng.
     '''
     config.train_transformer = transforms.Compose([
         myNormalize(config.datasets, train=True),
         myToTensor(),
         myRandomHorizontalFlip(p=0.5),
         myRandomVerticalFlip(p=0.5),
-        myRandomRotation(p=0.5, degree=[0, 360]),
+        myRandomRotation(p=0.5, degree=[0, 360], seed=getattr(config, 'seed', None)),
         myResize(config.input_size_h, config.input_size_w)
     ])
     config.test_transformer = transforms.Compose([
@@ -188,13 +191,16 @@ def get_config(args=None):
                 config.data_path = './data/data_isic1718/isic2017/'
         if args.work_dir is None:
             config.work_dir = 'results/' + config.network + '_' + config.datasets + '_' + datetime.now().strftime('%A_%d_%B_%Y_%Hh_%Mm_%Ss') + '/'
-        # rebuild so myNormalize picks up the stats of the selected dataset
-        build_transforms(config)
 
     for name in ('data_path', 'work_dir', 'epochs', 'batch_size', 'num_workers', 'val_interval', 'seed'):
         value = getattr(args, name, None)
         if value is not None:
             setattr(config, name, value)
+    # Rebuild once every override is in: myNormalize needs the final dataset and the rotation
+    # angle is a function of the final seed (a --seed override must reach it). This still runs
+    # before set_seed in train.py and consumes no global randomness, so it cannot shift model
+    # init or the per-sample augmentation coins.
+    build_transforms(config)
     hpa_mode = getattr(args, 'hpa_mode', None)
     if hpa_mode is not None:
         config.model_config['hpa_mode'] = hpa_mode

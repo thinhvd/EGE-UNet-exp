@@ -375,8 +375,18 @@ class myRandomVerticalFlip:
 
 
 class myRandomRotation:
-    def __init__(self, p=0.5, degree=[0,360]):
-        self.angle = random.uniform(degree[0], degree[1])
+    def __init__(self, p=0.5, degree=[0,360], seed=None):
+        # One angle per instance (the original behaviour). With seed=None it is drawn from the
+        # GLOBAL rng at construction time, which happens at import of configs.config_setting,
+        # i.e. before set_seed -> a different angle every run. With an int seed (EXP-5) the
+        # angle comes from a private generator: a function of the seed only, and neither the
+        # global python rng nor torch's rng is touched, so model init and the per-sample
+        # flip/rotate coins are exactly what they were.
+        self.seed = seed
+        if seed is None:
+            self.angle = random.uniform(degree[0], degree[1])
+        else:
+            self.angle = random.Random(seed).uniform(degree[0], degree[1])
         self.p = p
     def __call__(self, data):
         image, mask = data
