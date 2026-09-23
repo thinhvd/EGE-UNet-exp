@@ -12,7 +12,8 @@ Usage:
       --strata results/.../compare_fusion10_dsc/compare_runs_dsc_strata.csv \
       --cost results/.../cost_table_all10.csv \
       --out results/.../tong_hop_ket_qua.xlsx
-The --run labels must match the group names in the strata csv and the model names in the cost csv.
+The --run labels must match the group names in the strata csv and the model names in the cost csv
+(columns used: params, gmacs, gpu_bs1_ms, gpu_bs8_ms).
 '''
 import os
 import sys
@@ -50,14 +51,10 @@ COLS = [
     ('GPU: ms cho cả lô 8', 12, '0.00'),
     ('GPU: ms/ảnh khi chạy lô 8', 13, '0.00'),
     ('GPU: ảnh/giây (lô 8)', 12, '0'),
-    ('CPU: ms cho 1 ảnh (lô 1)', 12, '0.00'),
-    ('CPU: ms cho cả lô 8', 12, '0.00'),
-    ('CPU: ms/ảnh khi chạy lô 8', 13, '0.00'),
-    ('CPU: ảnh/giây (lô 8)', 12, '0'),
 ]
 # columns where a higher value is better / a lower value is better, for the bold-best marking
-BEST_MAX = {5, 6, 7, 8, 9, 13, 17}
-BEST_MIN = {2, 3, 4, 10, 11, 12, 14, 15, 16}
+BEST_MAX = {5, 6, 7, 8, 9, 13}
+BEST_MIN = {2, 3, 4, 10, 11, 12}
 
 
 def parse_args():
@@ -132,17 +129,12 @@ def main():
         put(ws, row, 11, float(c['gpu_bs8_ms']), fill=fill, fmt=COLS[10][2])
         put(ws, row, 12, f'=K{row}/8', fill=fill, fmt=COLS[11][2])
         put(ws, row, 13, f'=1000/L{row}', fill=fill, fmt=COLS[12][2])
-        put(ws, row, 14, float(c['cpu_bs1_ms']), fill=fill, fmt=COLS[13][2])
-        put(ws, row, 15, float(c['cpu_bs8_ms']), fill=fill, fmt=COLS[14][2])
-        put(ws, row, 16, f'=O{row}/8', fill=fill, fmt=COLS[15][2])
-        put(ws, row, 17, f'=1000/P{row}', fill=fill, fmt=COLS[16][2])
         values[lab] = {
             2: int(c['params']), 3: float(c['gmacs']), 4: 2 * float(c['gmacs']),
             5: 100 * t['miou'], 6: 100 * t['f1_or_dsc'], 7: 100 * float(s_all),
             8: 100 * float(strata[(small, lab)]['mean']), 9: 100 * float(strata[(large, lab)]['mean']),
             10: float(c['gpu_bs1_ms']), 11: float(c['gpu_bs8_ms']), 12: float(c['gpu_bs8_ms']) / 8,
-            13: 8000 / float(c['gpu_bs8_ms']), 14: float(c['cpu_bs1_ms']), 15: float(c['cpu_bs8_ms']),
-            16: float(c['cpu_bs8_ms']) / 8, 17: 8000 / float(c['cpu_bs8_ms']),
+            13: 8000 / float(c['gpu_bs8_ms']),
         }
 
     skip = {a.baseline} | {x for x in a.exclude_from_best.split(',') if x}
@@ -178,13 +170,13 @@ def main():
          'Bài báo EGE-UNet ghi 0,072 GFLOPs. Con số đó chính là cột GMACs ở đây (công cụ đo phổ biến gọi MACs '
          'là FLOPs); model gốc đo được 0,0721 GMACs. Cột GFLOPs = 2 × GMACs, tức số phép tính thật.'),
         ('Tốc độ',
-         'Ảnh 256×256, chế độ suy luận (không tính gradient). Mỗi biến thể đo 3 vòng, thứ tự các biến thể '
-         'xáo lại mỗi vòng; giá trị ghi ở đây là trung vị của 3 vòng. GPU: RTX 4090 thuê, 200 lần lặp/vòng '
-         'sau 50 lần làm nóng. CPU: máy local, 4 luồng, 50 lần lặp/vòng.'),
+         'Ảnh 256×256, chế độ suy luận (không tính gradient), đo trên GPU thuê; loại GPU ghi ở tiêu đề cột. '
+         'Mỗi biến thể đo 3 vòng, thứ tự các biến thể xáo lại mỗi vòng, 200 lần lặp/vòng sau 50 lần làm nóng; '
+         'giá trị ghi ở đây là trung vị của 3 vòng.'),
         ('Đọc số tốc độ thế nào',
-         'Chênh lệch dưới 1 ms trên GPU KHÔNG có ý nghĩa: cùng một biến thể dao động tới ±1 ms giữa các vòng. '
-         'Trên GPU, thứ tự tốc độ không bám theo GMACs vì model quá nhỏ nên thời gian chủ yếu là chi phí khởi '
-         'chạy kernel; trên CPU thì bám sát hơn. Latency của hai máy khác nhau không so trực tiếp được.'),
+         'Chênh lệch dưới 1 ms KHÔNG có ý nghĩa: cùng một biến thể dao động tới ±1 ms giữa các vòng. '
+         'Thứ tự tốc độ không bám theo GMACs vì model quá nhỏ nên thời gian chủ yếu là chi phí khởi chạy '
+         'kernel. Latency của hai máy/GPU khác nhau không so trực tiếp được.'),
         ('Điều kiện train',
          'ISIC2017, 1500 ảnh train / 650 ảnh val, 256×256, 300 epoch, batch 8, AdamW lr 1e-3, seed 42, '
          'mỗi cấu hình 1 lần train. Tập val đồng thời dùng để chọn model và để chấm điểm (theo code gốc).'),

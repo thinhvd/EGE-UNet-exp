@@ -5,6 +5,11 @@
 #   bash scripts/exp04_train.sh 1 3             # only runs 1 and 3 (see the table)
 #   PARALLEL=1 bash scripts/exp04_train.sh      # launch every run at once, detached
 #   PARALLEL=1 bash scripts/exp04_train.sh 0 1  # launch a subset, detached
+#   RUN_SUFFIX=_rep2 PARALLEL=1 bash scripts/exp04_train.sh 8   # repeat a run under a new name
+#
+# RUN_SUFFIX is appended to the run name. Use it to train the same configuration several times:
+# with this code no two runs are alike even with the same seed (see README section 6), so a set of
+# repeats is the only way to put an error bar on a configuration.
 #
 # Each run writes to results/<name>/ and auto-resumes from checkpoints/latest.pth if interrupted,
 # so re-running the same command after a disconnect continues where it stopped.
@@ -20,6 +25,9 @@
 #  6  fuse-csaa-all5               67662   the same, on every decoder stage
 #  7  fuse-sum_attn-deep3          59077   sum + the same attention (+1632 params over run 1)
 #  8  fuse-sum_attn-all5           59495   the same, on every decoder stage (+1632 over run 4)
+#  9  none+sum-deep3               49059   fusion WITHOUT GHPA (hpa_mode none): can the fusion path
+# 10  none+sum_attn-deep3          50691   replace the gate instead of sitting on top of it? Compare
+# 11  none+sum_attn-all5           51109   with run 0b (none, 44988) and run 0 (learnable, 53374).
 #
 # WHY THE BASELINES WERE RETRAINED. The EXP-1..3 numbers (learnable 80.35 mIoU, none 78.17) come from
 # earlier runs. No run of this code is reproducible, though - not across machines and not on one
@@ -43,6 +51,7 @@ BATCH_SIZE=${BATCH_SIZE:-8}
 NUM_WORKERS=${NUM_WORKERS:-0}   # EXP-1..3 all ran with 0; changing it changes the augmentation RNG stream
 DEVICE=${DEVICE:-cuda}
 PARALLEL=${PARALLEL:-}
+RUN_SUFFIX=${RUN_SUFFIX:-}
 
 # One process per run, each defaulting to a thread per core, means ~8x oversubscription when the
 # matrix runs in parallel: the runs then spend their time fighting over cores (observed: ~1570
@@ -65,6 +74,9 @@ RUNS=(
     "6|learnable|csaa|all5|67662"
     "7|learnable|sum_attn|deep3|59077"
     "8|learnable|sum_attn|all5|59495"
+    "9|none|sum|deep3|49059"
+    "10|none|sum_attn|deep3|50691"
+    "11|none|sum_attn|all5|51109"
 )
 
 WANTED=("$@")
@@ -82,7 +94,7 @@ run_name() {   # hpa_mode, fusion mode, stages
 for entry in "${RUNS[@]}"; do
     IFS='|' read -r idx hpa mode stages params <<<"$entry"
     want "$idx" || continue
-    name=$(run_name "$hpa" "$mode" "$stages")
+    name=$(run_name "$hpa" "$mode" "$stages")${RUN_SUFFIX}
     args=(--work-dir "results/$name" --dataset "$DATASET" --epochs "$EPOCHS"
           --batch-size "$BATCH_SIZE" --num-workers "$NUM_WORKERS" --device "$DEVICE"
           --seed "$SEED" --hpa-mode "$hpa")
@@ -123,7 +135,10 @@ python analysis/benchmark_speed.py --device cuda --out results/benchmark_gpu.jso
     --checkpoint results/egeunet_isic17_learnable_fuse-csaa-deep3_s42   --label csaa-deep3 \
     --checkpoint results/egeunet_isic17_learnable_fuse-csaa-all5_s42    --label csaa-all5 \
     --checkpoint results/egeunet_isic17_learnable_fuse-sum_attn-deep3_s42 --label sum_attn-deep3 \
-    --checkpoint results/egeunet_isic17_learnable_fuse-sum_attn-all5_s42  --label sum_attn-all5
+    --checkpoint results/egeunet_isic17_learnable_fuse-sum_attn-all5_s42  --label sum_attn-all5 \
+    --checkpoint results/egeunet_isic17_none_fuse-sum-deep3_s42           --label none+sum-deep3 \
+    --checkpoint results/egeunet_isic17_none_fuse-sum_attn-deep3_s42      --label none+sum_attn-deep3 \
+    --checkpoint results/egeunet_isic17_none_fuse-sum_attn-all5_s42       --label none+sum_attn-all5
 
 # then pull everything to the local machine and analyse there:
 #   SERVER=user@host bash scripts/sync_results.sh
