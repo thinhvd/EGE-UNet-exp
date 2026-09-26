@@ -114,6 +114,31 @@ def main():
     check('loss = base + weight * term', abs(total - expect) < 1e-6, f'{total:.6f} vs {expect:.6f}')
     check('running mean recorded', crit._n == 1 and abs(crit.epoch_mean() - float(C.LogArea(0.05)(out, g))) < 1e-6)
 
+    print('7. edt_torch (GPU path of the distance map) equals scipy')
+    import numpy as np
+    from scipy.ndimage import distance_transform_edt
+    masks = [disc(1, 5, 250).view(H, W) > 0, disc(40).view(H, W) > 0, torch.rand(H, W) > 0.97, torch.rand(H, W) > 0.03]
+    mask_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'data', 'data_isic1718', 'isic2017', 'train', 'masks')
+    if os.path.isdir(mask_dir):       # real lesion masks, also rotated, when the dataset is present
+        from PIL import Image
+        for name in sorted(os.listdir(mask_dir))[:12]:
+            m = np.array(Image.open(os.path.join(mask_dir, name)).convert('L').resize((W, H))) >= 128
+            masks += [torch.from_numpy(m), torch.from_numpy(np.ascontiguousarray(np.rot90(m)))]
+    worst = 0.0
+    for m in masks:
+        for feat in (m, ~m):
+            if feat.any():
+                ref = distance_transform_edt(~feat.numpy())
+                worst = max(worst, float(np.abs(C.edt_torch(feat).double().numpy() - ref).max()))
+    check(f'max |edt_torch - scipy| over {len(masks)} masks x 2 sides < 1e-4', worst < 1e-4, f'{worst:.2e}')
+    g = torch.stack([m.float() for m in masks[:6]]).unsqueeze(1)
+    cpu_path = C.signed_distance(g)                                    # scipy
+    same = [C.edt_torch(m) - (C.edt_torch(~m) - 1) * m if (m.any() and not m.all()) else torch.zeros(H, W)
+            for m in (g[:, 0] >= 0.5)]
+    diff = float((cpu_path[:, 0] - torch.stack(same)).abs().max())
+    check('signed distance: torch formula = scipy formula', diff < 1e-4, f'{diff:.2e}')
+
     print()
     if FAILED:
         print(f'{len(FAILED)} check(s) FAILED: {FAILED}')

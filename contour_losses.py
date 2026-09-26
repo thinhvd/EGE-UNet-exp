@@ -58,14 +58,42 @@ def tv_map(u):
     return torch.sqrt(dx[:, :, :, :-1] ** 2 + dy[:, :, :-1, :] ** 2 + TV_EPS)
 
 
+def edt_torch(feature):
+    '''Exact Euclidean distance of every pixel to the nearest True pixel of `feature` (H, W bool).
+
+    Two separable passes of squared distances (columns, then rows), each a brute-force min over one
+    axis. All intermediate values are exact integers in float32, so the result equals
+    scipy.ndimage.distance_transform_edt(~feature) up to the last bit of the square root. Needs
+    H*H*W + H*W*W floats of scratch (67 MB each at 256x256): meant for the GPU, where it takes a few
+    ms per image instead of the ~20 ms of scipy on a busy CPU.'''
+    h, w = feature.shape
+    big = torch.tensor(1e8, dtype=torch.float32, device=feature.device)   # "no feature in this column"
+    f = torch.where(feature, torch.zeros((), device=feature.device), big)
+    ys = torch.arange(h, dtype=torch.float32, device=feature.device)
+    xs = torch.arange(w, dtype=torch.float32, device=feature.device)
+    col = (ys[:, None, None] - ys[None, :, None]) ** 2 + f[None, :, :]      # (y, y', x)
+    g = col.amin(1)                                                        # (y, x): along columns
+    row = g[:, None, :] + (xs[:, None] - xs[None, :])[None] ** 2            # (y, x, x')
+    return row.amin(2).sqrt()
+
+
 def signed_distance(target):
     '''Signed distance to the ground-truth contour, per sample, same shape as target (B,1,H,W).
 
     Kervadec's convention: outside the lesion, the distance to the nearest lesion pixel; inside,
     minus (distance to the nearest background pixel - 1), so the pixels on both sides of the
-    contour get 1 and 0. Empty or full masks get zeros.'''
+    contour get 1 and 0. Empty or full masks get zeros. On a CUDA tensor the transform runs on the
+    GPU (edt_torch, same values); on CPU it uses scipy.'''
+    g = target.detach() >= 0.5
+    if g.is_cuda:
+        out = torch.zeros(g.shape, dtype=torch.float32, device=g.device)
+        for b in range(g.shape[0]):
+            m = g[b, 0]
+            if m.any() and not m.all():
+                out[b, 0] = edt_torch(m) - (edt_torch(~m) - 1) * m
+        return out
     from scipy.ndimage import distance_transform_edt
-    g = (target.detach() >= 0.5).cpu().numpy()
+    g = g.cpu().numpy()
     out = np.zeros(g.shape, dtype=np.float32)
     for b in range(g.shape[0]):
         m = g[b, 0]
