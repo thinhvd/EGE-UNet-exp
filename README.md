@@ -130,6 +130,31 @@ The run matrix is in [scripts/exp04_train.sh](scripts/exp04_train.sh).
 checkpoint or straight from flags). Note the units: the paper's "0.072 GFLOPs" is the GMACs column
 here (the thop convention of labelling MACs as FLOPs); the baseline measures 0.0721 GMACs.
 
+**5c. EXP-6: loss terms derived from Active Contour Loss (branch `exp/06-contour-loss`).**
+
+The model stays the original EGE-UNet; only the training loss changes. `--extra-term` adds one term,
+acting on the final output only, to the unchanged `GT_BceDiceLoss`; `--loss bce_region` instead swaps the
+Dice part of all six BceDice terms for the normalized active-contour region term. Implementation and
+formulas in [contour_losses.py](contour_losses.py); checks in `python tests/test_contour_losses.py`.
+
+| flag | what the term does |
+|---|---|
+| `--extra-term tv` | ACL length term (Chen et al. CVPR 2019): rewards a short contour |
+| `--extra-term tv_match` | contour length matched to the ground truth, \|TV(u)/TV(g) − 1\| |
+| `--extra-term area` | scale-invariant area term, SmoothL1 of log(Σu / Σg) |
+| `--extra-term bl` | boundary loss (Kervadec et al. MIDL 2019), distances in pixels |
+| `--extra-term snbl` | boundary loss with distances in radii of the lesion itself (`--snbl-tau`, default 3) |
+| `--loss bce_region` | Dice → Σ[u(1−g)² + (1−u)g²] / (Σg + 1) in every term |
+
+Every variant needs `--extra-weight`; the weights used are fixed before training by
+`analysis/calibrate_loss_weights.py` (gradient-norm matching on the train images of the EXP-5 baseline).
+Whatever the training loss, validation, and therefore checkpoint selection, and the final `test_loss` use
+the original `GT_BceDiceLoss`, so all variants pick their checkpoint by the same rule. With no loss flags
+the run is bit-identical to the previous code (checked on a 2-epoch CPU run: same `metrics.csv`, same
+`test_results.json`, same final weights). Run matrix: [scripts/exp06_train.sh](scripts/exp06_train.sh);
+evaluation: [scripts/exp06_analyze.sh](scripts/exp06_analyze.sh), which ends in
+`analysis/exp06_summary.py` (decision on pooled DSC).
+
 **6. Repository layout and experiment workflow.**
 
 ```

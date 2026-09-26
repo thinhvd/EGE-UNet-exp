@@ -221,6 +221,18 @@ def get_config(args=None):
     fusion_dim = getattr(args, 'fusion_dim', None)
     if fusion_dim is not None:
         config.model_config['fusion_dim'] = fusion_dim
+    # EXP-6 loss variants (contour_losses.py). Without the flags config.criterion stays the original
+    # GT_BceDiceLoss object and no selection_criterion is set, so train.py validates with it as before.
+    loss = getattr(args, 'loss', None) or 'bcedice'
+    extra_term = getattr(args, 'extra_term', None) or 'none'
+    if loss != 'bcedice' or extra_term != 'none':
+        from contour_losses import build_criterion
+        config.loss_config = dict(loss=loss, extra_term=extra_term,
+                                  extra_weight=getattr(args, 'extra_weight', None),
+                                  snbl_tau=getattr(args, 'snbl_tau', 3.0),
+                                  area_delta=getattr(args, 'area_delta', 0.05))
+        config.criterion = build_criterion(**config.loss_config)
+        config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
     config.device = args.device
     config.no_resume = args.no_resume
     return config

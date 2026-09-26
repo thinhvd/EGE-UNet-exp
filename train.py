@@ -13,6 +13,7 @@ import subprocess
 
 from utils import *
 from configs.config_setting import get_config
+from contour_losses import LOSS_MODES, EXTRA_TERMS, describe
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -91,6 +92,19 @@ def parse_args():
     parser.add_argument('--fusion-dim', type=int, default=None,
                         help='common channel width the encoder stages are projected to before fusion '
                              '(must be divisible by 4; default 16)')
+    parser.add_argument('--loss', type=str, default=None, choices=LOSS_MODES,
+                        help='EXP-6 base loss: bcedice (original GT_BceDiceLoss) or bce_region (Dice replaced '
+                             'by the normalized active-contour region term in all six terms). Default: bcedice')
+    parser.add_argument('--extra-term', type=str, default=None, choices=EXTRA_TERMS,
+                        help='EXP-6 term added to the base loss on the final output (see contour_losses.py): '
+                             'tv (ACL length), tv_match (length matched to GT), area (log-ratio area), '
+                             'bl (boundary loss, px), snbl (boundary loss in lesion radii). Default: none')
+    parser.add_argument('--extra-weight', type=float, default=None,
+                        help='weight of --extra-term (required with it)')
+    parser.add_argument('--snbl-tau', type=float, default=3.0,
+                        help='snbl: distances beyond this many lesion radii all cost the same (default 3)')
+    parser.add_argument('--area-delta', type=float, default=0.05,
+                        help='area: SmoothL1 knee on the log area ratio (default 0.05)')
     return parser.parse_args()
 
 
@@ -186,6 +200,15 @@ def main(config):
 
     print('#----------Prepareing loss, opt, sch and amp----------#')
     criterion = config.criterion
+    # EXP-6: validation (checkpoint selection) and the final test loss always use the original
+    # GT_BceDiceLoss, so every loss variant picks its checkpoint by the same rule. With no loss flags
+    # this is the training criterion itself.
+    select_criterion = getattr(config, 'selection_criterion', criterion)
+    has_extra = hasattr(criterion, 'epoch_mean')
+    log_info = (f'loss: {describe(**getattr(config, "loss_config", {}))}; checkpoint selection: '
+                f'{"original GT_BceDiceLoss" if select_criterion is not criterion else "same loss"}')
+    print(log_info)
+    logger.info(log_info)
     optimizer = get_optimizer(config, model)
     scheduler = get_scheduler(config, optimizer)
 
@@ -235,6 +258,8 @@ def main(config):
         # the lr actually used this epoch (scheduler.step() fires at the end of train_one_epoch)
         epoch_lr = optimizer.state_dict()['param_groups'][0]['lr']
 
+        if has_extra:
+            criterion.reset_stats()
         step, train_loss = train_one_epoch(
             train_loader,
             model,
@@ -251,7 +276,7 @@ def main(config):
         loss, val_metrics = val_one_epoch(
                 val_loader,
                 model,
-                criterion,
+                select_criterion,
                 epoch,
                 logger,
                 config
@@ -277,7 +302,9 @@ def main(config):
         row = {'epoch': epoch, 'train_loss': float(train_loss), 'val_loss': float(loss), 'lr': epoch_lr}
         if val_metrics is not None:
             row.update(val_metrics)
-        append_metrics_row(metrics_csv, METRIC_FIELDS, row)
+        if has_extra:   # EXP-6: per-epoch mean of the unweighted extra term, for monitoring
+            row['train_extra'] = criterion.epoch_mean()
+        append_metrics_row(metrics_csv, METRIC_FIELDS + (['train_extra'] if has_extra else []), row)
 
     if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
         print('#----------Testing----------#')
@@ -286,7 +313,7 @@ def main(config):
         loss, test_metrics = test_one_epoch(
                 val_loader,
                 model,
-                criterion,
+                select_criterion,
                 logger,
                 config,
             )
