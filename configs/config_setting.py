@@ -233,6 +233,8 @@ def get_config(args=None):
                                   area_delta=getattr(args, 'area_delta', 0.05))
         config.criterion = build_criterion(**config.loss_config)
         config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
+    config.save_every = getattr(args, 'save_every', None)
+    config.save_from = getattr(args, 'save_from', 200)
     config.device = args.device
     config.no_resume = args.no_resume
     return config

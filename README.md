@@ -155,6 +155,21 @@ the run is bit-identical to the previous code (checked on a 2-epoch CPU run: sam
 evaluation: [scripts/exp06_analyze.sh](scripts/exp06_analyze.sh), which ends in
 `analysis/exp06_summary.py` (decision on pooled DSC).
 
+**5d. EXP-7: refining the boundary loss (branch `exp/07-e3a-refine`).**
+
+EXP-6's best variant, the boundary loss (`bl`), removed far spill around small lesions but dropped faint
+tissue of large lesions. EXP-7 adds the prediction-side half of Karimi & Salcudean's two-sided distance loss:
+`--extra-term fn_dp` penalizes each missed lesion pixel by its distance to the current prediction (capped at
+the lesion's inradius), so dropping a whole chunk is expensive and a thin missed rim is cheap. Terms can be
+combined with their own weights: `--extra-term bl,fn_dp --extra-weight 0.095,0.51` (each term's per-epoch mean
+is logged as `train_extra_<name>`). The `fn_dp` weight comes from a pre-registered total-push balance on the
+EXP-6 checkpoint (`analysis/calibrate_loss_weights.py --mass-balance`). `--save-every N` (default off)
+also keeps every N-th epoch from `--save-from` (200) on. Runs: [scripts/exp07_train.sh](scripts/exp07_train.sh),
+per-box runner [scripts/exp07_box.sh](scripts/exp07_box.sh), evaluation
+[scripts/exp07_analyze.sh](scripts/exp07_analyze.sh), mechanism probe `analysis/e3a_mechanism.py`, and
+[scripts/finish_box.sh](scripts/finish_box.sh) to pull, verify and destroy a finished box. With no loss flags,
+and with `--extra-term bl` alone, runs are bit-identical to the EXP-6 code (checked on a 2-epoch CPU run).
+
 **6. Repository layout and experiment workflow.**
 
 ```

@@ -139,6 +139,55 @@ def main():
     diff = float((cpu_path[:, 0] - torch.stack(same)).abs().max())
     check('signed distance: torch formula = scipy formula', diff < 1e-4, f'{diff:.2e}')
 
+    print('8. EXP-7: fn_dp (misses weighted by distance to the prediction) and several terms at once')
+    g = disc(40)
+    fn = C.FNDistance()
+    check('fn_dp = 0 when the prediction covers the lesion', float(fn(g.clone(), g)) == 0.0)
+    check('fn_dp = 0 for a larger prediction (spill is not its business)', float(fn(disc(55), g)) == 0.0)
+    u = disc(30).requires_grad_(True)            # a shrunk prediction: a 10 px missed ring
+    fn(u, g).backward()
+    missed = (g > 0) & (u.detach() < 0.5)
+    check('fn_dp gradient only on missed lesion pixels', bool((u.grad[~missed] == 0).all()) and bool((u.grad[missed] < 0).all()))
+    empty = torch.zeros(1, 1, H, W).requires_grad_(True)
+    v = fn(empty, g)
+    v.backward()
+    inradius = float(distance_transform_edt(g[0, 0].numpy() > 0).max())
+    check('empty prediction: finite, each lesion pixel weighted by the inradius',
+          bool(torch.isfinite(v)) and abs(float(v) - inradius * float(g.mean())) < 1e-4, f'{float(v):.4f}')
+    # distance map vs scipy, with the inradius cap
+    p = disc(12, 100, 100) + disc(10, 150, 170)
+    d = C.distance_to_prediction(p, g)[0, 0].numpy()
+    ref = np.minimum(distance_transform_edt(~(p[0, 0].numpy() >= 0.5)), inradius)
+    check('distance_to_prediction = min(scipy edt, inradius)', float(np.abs(d - ref).max()) < 1e-4)
+    both = [(p, g), (torch.zeros_like(g), g), (g.clone(), g), (disc(30), torch.zeros_like(g)), (disc(5), torch.ones_like(g))]
+    worst = max(float((C.distance_to_prediction(a_, b_, backend='torch') - C.distance_to_prediction(a_, b_)).abs().max())
+                for a_, b_ in both)
+    check('GPU (edt_torch) path = scipy path, incl. empty / full cases', worst < 1e-4, f'{worst:.1e}')
+    # a dropped chunk costs more per pixel than a thin missed rim of the same lesion
+    chunk = g.clone(); chunk[..., 128:, :] = 0                 # lower half missed
+    rim = disc(38)                                              # 2 px rim missed
+    per_px = lambda pr: float(fn(pr, g)) / max(float(((g > 0) & (pr < 0.5)).float().mean()), 1e-9)
+    check('missed chunk costs more per pixel than a missed rim', per_px(chunk) > 3 * per_px(rim),
+          f'chunk {per_px(chunk):.1f} vs rim {per_px(rim):.1f} per missed px')
+    # multi-term wrapper
+    crit = C.build_criterion(extra_term='bl,fn_dp', extra_weight='0.095,0.35')
+    out = torch.sigmoid(torch.randn(2, 1, H, W)); gg = disc(25).repeat(2, 1, 1, 1)
+    gt_pre = tuple(torch.sigmoid(torch.randn(2, 1, H, W)) for _ in range(5))
+    total = float(crit(gt_pre, out, gg))
+    expect = float(GT_BceDiceLoss(1, 1)(gt_pre, out, gg)) + 0.095 * float(C.BoundaryLoss()(out, gg)) \
+        + 0.35 * float(C.FNDistance()(out, gg))
+    check('bl,fn_dp: loss = base + 0.095 * bl + 0.35 * fn_dp', abs(total - expect) < 1e-5, f'{total:.6f} vs {expect:.6f}')
+    check('per-term running means recorded', set(crit.epoch_means()) == {'bl', 'fn_dp'})
+    single = C.build_criterion(extra_term='bl', extra_weight='0.095')
+    check('single term keeps the EXP-6 arithmetic', abs(float(single(gt_pre, out, gg)) -
+          (float(GT_BceDiceLoss(1, 1)(gt_pre, out, gg)) + 0.095 * float(C.BoundaryLoss()(out, gg)))) < 1e-6)
+    for bad in (('bl,fn_dp', '0.1'), ('bl,bl', '0.1,0.1'), ('foo', '0.1')):
+        try:
+            C.parse_terms(*bad)
+            check(f'malformed {bad} refused', False)
+        except ValueError:
+            check(f'malformed {bad} refused', True)
+
     print()
     if FAILED:
         print(f'{len(FAILED)} check(s) FAILED: {FAILED}')

@@ -13,7 +13,7 @@ import subprocess
 
 from utils import *
 from configs.config_setting import get_config
-from contour_losses import LOSS_MODES, EXTRA_TERMS, describe
+from contour_losses import LOSS_MODES, EXTRA_TERMS, describe, parse_terms
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -95,17 +95,26 @@ def parse_args():
     parser.add_argument('--loss', type=str, default=None, choices=LOSS_MODES,
                         help='EXP-6 base loss: bcedice (original GT_BceDiceLoss) or bce_region (Dice replaced '
                              'by the normalized active-contour region term in all six terms). Default: bcedice')
-    parser.add_argument('--extra-term', type=str, default=None, choices=EXTRA_TERMS,
-                        help='EXP-6 term added to the base loss on the final output (see contour_losses.py): '
-                             'tv (ACL length), tv_match (length matched to GT), area (log-ratio area), '
-                             'bl (boundary loss, px), snbl (boundary loss in lesion radii). Default: none')
-    parser.add_argument('--extra-weight', type=float, default=None,
-                        help='weight of --extra-term (required with it)')
+    parser.add_argument('--extra-term', type=str, default=None,
+                        help='term(s) added to the base loss on the final output, comma-separated (see '
+                             'contour_losses.py): tv (ACL length), tv_match (length matched to GT), area '
+                             '(log-ratio area), bl (boundary loss, px), snbl (boundary loss in lesion radii), '
+                             'fn_dp (misses weighted by distance to the prediction). Default: none. '
+                             f'Choices: {", ".join(EXTRA_TERMS[1:])}')
+    parser.add_argument('--extra-weight', type=str, default=None,
+                        help='weight(s) of --extra-term, comma-separated in the same order (required with it)')
     parser.add_argument('--snbl-tau', type=float, default=3.0,
                         help='snbl: distances beyond this many lesion radii all cost the same (default 3)')
     parser.add_argument('--area-delta', type=float, default=0.05,
                         help='area: SmoothL1 knee on the log area ratio (default 0.05)')
-    return parser.parse_args()
+    parser.add_argument('--save-every', type=int, default=None,
+                        help='also keep the weights of every N-th epoch from --save-from on '
+                             '(checkpoints/epochNNN.pth), to measure how much the chosen epoch matters. '
+                             'Default: off (only best and latest, as before)')
+    parser.add_argument('--save-from', type=int, default=200)
+    args = parser.parse_args()
+    parse_terms(args.extra_term or 'none', args.extra_weight)   # fail early on a malformed term list
+    return args
 
 
 def main(config):
@@ -204,7 +213,10 @@ def main(config):
     # GT_BceDiceLoss, so every loss variant picks its checkpoint by the same rule. With no loss flags
     # this is the training criterion itself.
     select_criterion = getattr(config, 'selection_criterion', criterion)
-    has_extra = hasattr(criterion, 'epoch_mean')
+    has_extra = hasattr(criterion, 'epoch_means')
+    # one extra term keeps EXP-6's single 'train_extra' column; several get one column each
+    extra_fields = (['train_extra'] if has_extra and len(criterion.names) == 1 else
+                    [f'train_extra_{n}' for n in criterion.names] if has_extra else [])
     log_info = (f'loss: {describe(**getattr(config, "loss_config", {}))}; checkpoint selection: '
                 f'{"original GT_BceDiceLoss" if select_criterion is not criterion else "same loss"}')
     print(log_info)
@@ -302,9 +314,15 @@ def main(config):
         row = {'epoch': epoch, 'train_loss': float(train_loss), 'val_loss': float(loss), 'lr': epoch_lr}
         if val_metrics is not None:
             row.update(val_metrics)
-        if has_extra:   # EXP-6: per-epoch mean of the unweighted extra term, for monitoring
-            row['train_extra'] = criterion.epoch_mean()
-        append_metrics_row(metrics_csv, METRIC_FIELDS + (['train_extra'] if has_extra else []), row)
+        if has_extra:   # per-epoch mean of each unweighted extra term, for monitoring
+            means = criterion.epoch_means()
+            if extra_fields == ['train_extra']:
+                row['train_extra'] = means[criterion.names[0]]
+            else:
+                row.update({f'train_extra_{n}': v for n, v in means.items()})
+        append_metrics_row(metrics_csv, METRIC_FIELDS + extra_fields, row)
+        if getattr(config, 'save_every', None) and epoch >= config.save_from and epoch % config.save_every == 0:
+            atomic_torch_save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch{epoch:03d}.pth'))
 
     if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
         print('#----------Testing----------#')

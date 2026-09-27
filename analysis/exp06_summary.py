@@ -13,6 +13,11 @@ Reads test_results.json and analysis/per_image_metrics_full.csv, both kept by th
 runs the same on the server and on the synced local folder.
 
   python analysis/exp06_summary.py --results-dir results --datasets "isic17 isic18" --out results/exp06_summary.md
+
+Other batches (EXP-7) pass their own variants; the first one is the baseline. Several run-name patterns
+joined by '|' are repeats of one configuration: every column is their mean and the table says how many:
+  --variant 'Baseline=egeunet_{ds}_learnable_s{seed}=luật hiện tại' \
+  --variant 'X1=egeunet_{ds}_learnable_loss-bl+fndp_s{seed}|egeunet_{ds}_learnable_loss-bl+fndp_s{seed}_rep1=E3a + phạt bỏ sót'
 '''
 import os
 import csv
@@ -41,7 +46,21 @@ def parse_args():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--min-gain', type=float, default=0.6, help='pooled DSC points needed to pass')
     p.add_argument('--out', required=True, help='markdown path; a .csv with the same stem is written too')
+    p.add_argument('--variant', action='append', default=[],
+                   help="LABEL=PATTERN[|PATTERN...]=DESCRIPTION; default: the EXP-6 set. First = baseline")
+    p.add_argument('--title', default='EXP-6 — kết quả theo DSC pooled')
     return p.parse_args()
+
+
+def mean_run(dirs):
+    '''Mean of every numeric column over the runs that exist; None if none exists.'''
+    got = [r for r in (load_run(d) for d in dirs) if r is not None]
+    if not got:
+        return None
+    out = {k: (float(np.mean([r[k] for r in got])) if k != 'best_epoch' else '/'.join(str(r[k]) for r in got))
+           for k in got[0]}
+    out['n_runs'] = len(got)
+    return out
 
 
 def load_run(run_dir):
@@ -73,15 +92,21 @@ def fmt(x, d=2, sign=False):
 
 def main():
     a = parse_args()
+    global VARIANTS
+    if a.variant:
+        VARIANTS = []
+        for v in a.variant:
+            lab, pats, what = v.split('=', 2)
+            VARIANTS.append((lab, pats, what))
     datasets = a.datasets.split()
-    md = ['# EXP-6 — kết quả theo DSC pooled', '',
+    md = [f'# {a.title}', '',
           f'Quyết thắng thua bằng **DSC pooled**. Một phiên bản được vào vòng xác nhận (E5) khi DSC pooled '
           f'cao hơn Baseline cùng đợt **ít nhất {fmt(a.min_gain, 1)} điểm ở mọi dataset**. Các cột còn lại chỉ để tham khảo.', '']
     long_rows, passed = [], {v[0]: [] for v in VARIANTS[1:]}
     for ds in datasets:
-        runs = {lab: load_run(os.path.join(a.results_dir, pat.format(ds=ds, seed=a.seed)))
+        runs = {lab: mean_run([os.path.join(a.results_dir, p.format(ds=ds, seed=a.seed)) for p in pat.split('|')])
                 for lab, pat, _ in VARIANTS}
-        base = runs['Baseline']
+        base = runs[VARIANTS[0][0]]
         md += [f'## {ds.upper()}', '']
         if base is None:
             md += ['Baseline chưa có kết quả — bỏ qua dataset này.', '']
@@ -94,11 +119,12 @@ def main():
             if r is None:
                 md.append(f'| {lab} | {what} | chưa có | | | | | | | | | |')
                 continue
-            delta = None if lab == 'Baseline' else r['pooled_dsc'] - base['pooled_dsc']
+            delta = None if lab == VARIANTS[0][0] else r['pooled_dsc'] - base['pooled_dsc']
+            lab_n = lab + (f" ({r['n_runs']} run, TB)" if r.get('n_runs', 1) > 1 else '')
             ok = '' if delta is None else ('**có**' if delta >= a.min_gain else 'không')
             if delta is not None:
                 passed[lab].append(delta >= a.min_gain)
-            md.append(f'| {lab} | {what} | **{fmt(r["pooled_dsc"])}** | {fmt(delta, sign=True)} | {ok} | {fmt(r["miou"])} '
+            md.append(f'| {lab_n} | {what} | **{fmt(r["pooled_dsc"])}** | {fmt(delta, sign=True)} | {ok} | {fmt(r["miou"])} '
                       f'| {fmt(r["dsc_img"])} | {fmt(r["dsc_small"])} | {fmt(r["dsc_large"])} '
                       f'| {fmt(r["area_small_pct"], 1, True)} % · {fmt(r["area_large_pct"], 1, True)} % '
                       f'| {fmt(r["oracle_small"])} | {r["best_epoch"]} |')

@@ -1,5 +1,5 @@
 '''
-EXP-6 loss terms (branch exp/06-contour-loss), all default-off.
+EXP-6 / EXP-7 loss terms (branches exp/06-contour-loss, exp/07-e3a-refine), all default-off.
 
 With `--loss bcedice --extra-term none` (the defaults) build_criterion() returns the original
 utils.GT_BceDiceLoss object, so training is the author's computation bit for bit.
@@ -25,6 +25,16 @@ over the batch unless stated otherwise):
                  same distance weighting measured in radii of the lesion itself, so a spill of a
                  given relative width costs the same whatever the lesion size
 
+  fn_dp     EXP-7 mean over pixels of g * (1 - u) * d_P, with d_P the distance to the current
+                 prediction {u >= 0.5} (no gradient through d_P), capped at the lesion's inradius:
+                 the prediction-side half of Karimi & Salcudean's two-sided distance loss (IEEE TMI
+                 2020). A missed pixel costs more the farther it lies from what the model draws, so
+                 dropping a whole chunk of a lesion is expensive while a thin missed rim is cheap.
+                 Added to bl it gives E3a a penalty for misses as well as for spill.
+
+Several terms can be added at once, each with its own weight:
+    --extra-term bl,fn_dp --extra-weight 0.095,0.35
+
 Region term used by E2 (the ACL region term with c1 = 1, c2 = 0, normalized by the lesion area):
   region         sum [u (1 - g)^2 + (1 - u) g^2] / (sum g + 1)
 
@@ -41,7 +51,7 @@ import torch.nn.functional as F
 from utils import BCELoss, GT_BceDiceLoss
 
 LOSS_MODES = ['bcedice', 'bce_region']
-EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl']
+EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp']
 TV_EPS = 1e-8
 
 
@@ -99,6 +109,37 @@ def signed_distance(target):
         m = g[b, 0]
         if m.any() and not m.all():
             out[b, 0] = distance_transform_edt(~m) - (distance_transform_edt(m) - 1) * m
+    return torch.from_numpy(out).to(target.device)
+
+
+def distance_to_prediction(u, target, backend=None):
+    '''Distance of every pixel to the current prediction {u >= 0.5}, per sample, capped at the
+    lesion's inradius (the largest distance from a lesion pixel to the background). The weight
+    carries no gradient. An empty prediction gives the inradius everywhere; an empty lesion zeros.
+    GPU tensors use edt_torch, CPU tensors scipy (same values); backend='torch' forces edt_torch.'''
+    pred = u.detach() >= 0.5
+    g = target.detach() >= 0.5
+    h, w = g.shape[-2:]
+    if backend == 'torch' or (backend is None and g.is_cuda):
+        out = torch.zeros(g.shape, dtype=torch.float32, device=g.device)
+        for b in range(g.shape[0]):
+            m = g[b, 0]
+            if not m.any():
+                continue
+            cap = edt_torch(~m)[m].max() if not m.all() else torch.tensor(float(max(h, w)), device=g.device)
+            p = pred[b, 0]
+            out[b, 0] = torch.minimum(edt_torch(p), cap) if p.any() else cap
+        return out
+    from scipy.ndimage import distance_transform_edt
+    g, pred = g.cpu().numpy(), pred.cpu().numpy()
+    out = np.zeros(g.shape, dtype=np.float32)
+    for b in range(g.shape[0]):
+        m = g[b, 0]
+        if not m.any():
+            continue
+        cap = distance_transform_edt(m)[m].max() if not m.all() else float(max(h, w))
+        p = pred[b, 0]
+        out[b, 0] = np.minimum(distance_transform_edt(~p), cap) if p.any() else cap
     return torch.from_numpy(out).to(target.device)
 
 
@@ -168,7 +209,15 @@ class RegionLoss(nn.Module):
         return (num / (_per_image(target).sum(1) + 1.0)).mean()
 
 
-TERM_CLASSES = {'tv': TVLength, 'tv_match': TVMatch, 'area': LogArea,
+class FNDistance(nn.Module):
+    '''EXP-7: mean over pixels of g * (1 - u) * d_P (see distance_to_prediction). Zero when the
+    prediction covers the lesion; only missed lesion pixels get a gradient.'''
+    def forward(self, u, target):
+        g = (target >= 0.5).float()
+        return (g * (1 - u) * distance_to_prediction(u, target)).mean()
+
+
+TERM_CLASSES = {'fn_dp': FNDistance, 'tv': TVLength, 'tv_match': TVMatch, 'area': LogArea,
                 'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss}
 
 
@@ -201,51 +250,83 @@ class GT_BceRegionLoss(nn.Module):
 
 
 class WithExtraTerm(nn.Module):
-    '''base(gt_pre, out, target) + weight * term(out, target).
+    '''base(gt_pre, out, target) + sum_k weight_k * term_k(out, target).
 
-    Keeps a running sum of the unweighted term so train.py can log its per-epoch mean.'''
-    def __init__(self, base, term, weight):
+    `terms` is a list of (name, module, weight). Keeps a running sum of every unweighted term so
+    train.py can log its per-epoch mean. With one term the arithmetic is exactly EXP-6's
+    base + weight * term.'''
+    def __init__(self, base, terms):
         super().__init__()
-        self.base, self.term, self.weight = base, term, float(weight)
+        self.base = base
+        self.names = [n for n, _, _ in terms]
+        self.terms = nn.ModuleList([t for _, t, _ in terms])
+        self.weights = [float(w) for _, _, w in terms]
         self.reset_stats()
 
     def reset_stats(self):
-        self._sum, self._n = 0.0, 0
+        self._sums, self._n = [0.0] * len(self.terms), 0
+
+    def epoch_means(self):
+        return {n: (s / self._n if self._n else float('nan')) for n, s in zip(self.names, self._sums)}
 
     def epoch_mean(self):
-        return self._sum / self._n if self._n else float('nan')
+        return self.epoch_means()[self.names[0]]
 
     def forward(self, gt_pre, out, target):
-        extra = self.term(out, target)
-        self._sum += float(extra.detach())
+        extras = [t(out, target) for t in self.terms]
+        for k, e in enumerate(extras):
+            self._sums[k] += float(e.detach())
         self._n += 1
-        return self.base(gt_pre, out, target) + self.weight * extra
+        total = self.base(gt_pre, out, target)
+        for w, e in zip(self.weights, extras):
+            total = total + w * e
+        return total
+
+
+def parse_terms(extra_term='none', extra_weight=None):
+    '''"bl,fn_dp" and "0.095,0.35" (or a float) -> [('bl', 0.095), ('fn_dp', 0.35)]; [] for none.'''
+    names = [t.strip() for t in str(extra_term).split(',') if t.strip()]
+    if names in ([], ['none']):
+        return []
+    for n in names:
+        if n not in EXTRA_TERMS or n == 'none':
+            raise ValueError(f'unknown extra term {n!r}; choose from {EXTRA_TERMS[1:]}')
+    if len(set(names)) != len(names):
+        raise ValueError(f'extra term listed twice: {extra_term!r}')
+    if extra_weight is None:
+        raise ValueError(f'--extra-term {extra_term} needs --extra-weight')
+    weights = [float(w) for w in str(extra_weight).split(',')] if isinstance(extra_weight, str) \
+        else [float(extra_weight)]
+    if len(weights) != len(names):
+        raise ValueError(f'{len(names)} extra terms but {len(weights)} weights: {extra_term!r} / {extra_weight!r}')
+    return list(zip(names, weights))
 
 
 def describe(loss='bcedice', extra_term='none', extra_weight=None, **kw):
-    s = loss if extra_term == 'none' else f'{loss} + {extra_weight} * {extra_term}'
-    if extra_term == 'snbl':
+    terms = parse_terms(extra_term, extra_weight)
+    s = loss + ''.join(f' + {w:g} * {n}' for n, w in terms)
+    names = [n for n, _ in terms]
+    if 'snbl' in names:
         s += f' (tau {kw.get("snbl_tau", 3.0)})'
-    if extra_term == 'area':
+    if 'area' in names:
         s += f' (delta {kw.get("area_delta", 0.05)})'
     return s
+
+
+def make_term(name, snbl_tau=3.0, area_delta=0.05):
+    if name == 'snbl':
+        return ScaleNormBoundaryLoss(tau=snbl_tau)
+    if name == 'area':
+        return LogArea(delta=area_delta)
+    return TERM_CLASSES[name]()
 
 
 def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05):
     '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1).'''
     if loss not in LOSS_MODES:
         raise ValueError(f'unknown loss {loss!r}; choose from {LOSS_MODES}')
-    if extra_term not in EXTRA_TERMS:
-        raise ValueError(f'unknown extra term {extra_term!r}; choose from {EXTRA_TERMS}')
+    terms = parse_terms(extra_term, extra_weight)
     base = GT_BceDiceLoss(wb=1, wd=1) if loss == 'bcedice' else GT_BceRegionLoss(wb=1, wr=1)
-    if extra_term == 'none':
+    if not terms:
         return base
-    if extra_weight is None:
-        raise ValueError(f'--extra-term {extra_term} needs --extra-weight')
-    if extra_term == 'snbl':
-        term = ScaleNormBoundaryLoss(tau=snbl_tau)
-    elif extra_term == 'area':
-        term = LogArea(delta=area_delta)
-    else:
-        term = TERM_CLASSES[extra_term]()
-    return WithExtraTerm(base, term, extra_weight)
+    return WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta), w) for n, w in terms])

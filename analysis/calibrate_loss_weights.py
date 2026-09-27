@@ -13,6 +13,17 @@ where the model is confidently wrong, so the mean of the BceDice norm is set by 
 
   python analysis/calibrate_loss_weights.py --checkpoint results/EGE-UNet-results-exp5/egeunet_isic17_learnable_s42 \
       --dataset isic17 --data-path data/data_isic1718/isic2017 --out results/.../loss_weights_isic17.json
+
+EXP-7, --mass-balance: weight of fn_dp relative to bl, on an E3a checkpoint. The gradient of a term
+with respect to a logit is (d term / d u) * u(1-u); summed over the train images this is the term's
+total push. bl pushes background pixels down with phi_G / N; fn_dp pushes missed lesion pixels up with
+d_P / N. The pre-registered rule makes the two totals equal:
+    beta_fn = beta_bl * sum_bg phi_G u(1-u) / sum_lesion d_P u(1-u)
+(d_P from the checkpoint's own prediction, capped at the inradius, exactly as in training).
+
+  python analysis/calibrate_loss_weights.py --mass-balance --beta-bl 0.095 \
+      --checkpoint results/EGE-UNet-results-exp6/egeunet_isic17_learnable_loss-bl_s42 \
+      --dataset isic17 --data-path data/data_isic1718/isic2017 --out .../mass_balance_isic17.json
 '''
 import os
 import sys
@@ -38,6 +49,8 @@ def parse_args():
     p.add_argument('--area-delta', type=float, default=0.05)
     p.add_argument('--limit', type=int, default=0, help='use only the first N train images (0 = all)')
     p.add_argument('--out', default=None, help='json path for the table')
+    p.add_argument('--mass-balance', action='store_true', help='EXP-7: weight of fn_dp from total push balance')
+    p.add_argument('--beta-bl', type=float, default=0.095)
     return p.parse_args()
 
 
@@ -45,6 +58,44 @@ def grad_norm(loss_fn, u, g):
     u = u.detach().clone().requires_grad_(True)
     (grad,) = torch.autograd.grad(loss_fn(u, g), u)
     return float(grad.norm())
+
+
+def mass_balance(a, model, loader):
+    import contour_losses as L
+    names = ['small', 'mid', 'large']
+    per_image = []                      # (lesion area, bl push-down on background, bl push-up on lesion, fn_dp push-up)
+    for img, msk in loader:
+        with torch.no_grad():
+            _, u = model(img.float())
+        g = msk.float()
+        phi = L.signed_distance(g)
+        d_p = L.distance_to_prediction(u, g)
+        s = u * (1 - u)
+        fg = (g >= 0.5).float()
+        for b in range(u.shape[0]):
+            per_image.append((float(fg[b].sum()), float(((1 - fg[b]) * phi[b] * s[b]).sum()),
+                              float((fg[b] * (-phi[b]) * s[b]).sum()), float((fg[b] * d_p[b] * s[b]).sum())))
+    r = np.array(per_image)
+    t = np.digitize(r[:, 0], np.quantile(r[:, 0], [1 / 3, 2 / 3]))
+    tot = r[:, 1:].sum(0)
+    beta_fn = a.beta_bl * tot[0] / tot[2]
+    table = {'checkpoint': C_resolve(a.checkpoint), 'dataset': a.dataset, 'n_images': len(r), 'beta_bl': a.beta_bl,
+             'bl_push_down_background': tot[0], 'bl_push_up_lesion': tot[1], 'fn_dp_push_up_lesion': tot[2],
+             'beta_fn': beta_fn, 'by_tertile': {}}
+    print(f'{a.dataset}: {len(r)} train images, logit-space push summed over the set (u(1-u) weighted)')
+    for k, n in enumerate(names):
+        m = t == k
+        table['by_tertile'][n] = {'bl_down': r[m, 1].sum(), 'bl_up': r[m, 2].sum(), 'fn_dp_up': r[m, 3].sum()}
+        print(f'  {n:5s}: bl push-down on background {r[m, 1].sum():10.1f} | bl push-up on lesion {r[m, 2].sum():10.1f} '
+              f'| fn_dp push-up {r[m, 3].sum():10.1f}')
+    print(f'  total: bl down {tot[0]:.1f}, bl up {tot[1]:.1f}, fn_dp up {tot[2]:.1f}  ->  beta_fn = '
+          f'{a.beta_bl} x {tot[0]:.1f} / {tot[2]:.1f} = {beta_fn:.4f}')
+    return table
+
+
+def C_resolve(path):
+    from analysis import common as C
+    return C.resolve_checkpoint(path)
 
 
 def main():
@@ -66,6 +117,14 @@ def main():
     model, _ = C.build_model(sd, 'cpu', None, strict=True)
     model.eval()
 
+    if a.mass_balance:
+        table = mass_balance(a, model, loader)
+        if a.out:
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, 'w') as f:
+                json.dump(table, f, indent=2, default=float)
+            print(f'wrote {a.out}')
+        return
     terms = {'tv': L.TVLength(), 'tv_match': L.TVMatch(), 'area': L.LogArea(a.area_delta),
              'bl': L.BoundaryLoss(), 'snbl': L.ScaleNormBoundaryLoss(a.snbl_tau)}
     base = BceDiceLoss(wb=1, wd=1)
