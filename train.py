@@ -81,14 +81,17 @@ def parse_args():
                         help='free-form comma list of GHPA stages, e.g. "enc3,enc4,enc5,dec2,dec3,dec4" '
                              '(overrides --ghpa-placement)')
     parser.add_argument('--fusion', type=str, default=None,
-                        choices=['none', 'sum', 'concat', 'csaa', 'sum_attn'],
+                        choices=['none', 'sum', 'concat', 'csaa', 'sum_attn', 'bg_stage'],
                         help='EXP-4 cross-stage fusion feeding decoder stages a fused view of all five '
                              'encoder stages: none (original), sum / concat (controls without attention), '
                              'csaa (concat + cross-stage axial attention), sum_attn (sum + the same '
-                             'attention). Default: config value (none)')
-    parser.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5'],
+                             'attention). EXP-9: bg_stage (sum whose per-source weights change on the '
+                             'contour predicted by a boundary head; needs --fusion-stages shallow3 and '
+                             '--boundary-weight). Default: config value (none)')
+    parser.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5', 'shallow3'],
                         help='which decoder stages receive the fused feature (see models.fusion.'
-                             'FUSION_STAGE_SETS); deep3 = dec1/2/3, all5 = every decoder stage')
+                             'FUSION_STAGE_SETS); deep3 = dec1/2/3, all5 = every decoder stage, '
+                             'shallow3 = dec3/4/5')
     parser.add_argument('--fusion-dim', type=int, default=None,
                         help='common channel width the encoder stages are projected to before fusion '
                              '(must be divisible by 4; default 16)')
@@ -107,6 +110,10 @@ def parse_args():
                         help='snbl: distances beyond this many lesion radii all cost the same (default 3)')
     parser.add_argument('--area-delta', type=float, default=0.05,
                         help='area: SmoothL1 knee on the log area ratio (default 0.05)')
+    parser.add_argument('--boundary-weight', type=float, default=None,
+                        help='EXP-9: weight of the contour-band loss on the boundary heads of --fusion bg_stage '
+                             '(required with it; 0 = the band loss is only logged, the boundary heads then '
+                             'learn through the fusion alone)')
     parser.add_argument('--save-every', type=int, default=None,
                         help='also keep the weights of every N-th epoch from --save-from on '
                              '(checkpoints/epochNNN.pth), to measure how much the chosen epoch matters. '
@@ -114,6 +121,17 @@ def parse_args():
     parser.add_argument('--save-from', type=int, default=200)
     args = parser.parse_args()
     parse_terms(args.extra_term or 'none', args.extra_weight)   # fail early on a malformed term list
+    # EXP-9: the boundary-guided fusion and its band loss only make sense together, on dec3..dec5
+    # (the band-loss weights are defined per stage there). 0 is a valid weight, so test against None.
+    if args.fusion == 'bg_stage':
+        if args.boundary_weight is None:
+            parser.error('--fusion bg_stage needs an explicit --boundary-weight (0 = band loss logged only)')
+        if args.fusion_stages != 'shallow3':
+            parser.error('--fusion bg_stage needs --fusion-stages shallow3')
+    elif args.boundary_weight is not None:
+        parser.error('--boundary-weight only goes with --fusion bg_stage')
+    if args.boundary_weight is not None and args.boundary_weight < 0:
+        parser.error('--boundary-weight must be >= 0')
     return args
 
 

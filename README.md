@@ -170,6 +170,25 @@ per-box runner [scripts/exp07_box.sh](scripts/exp07_box.sh), evaluation
 [scripts/finish_box.sh](scripts/finish_box.sh) to pull, verify and destroy a finished box. With no loss flags,
 and with `--extra-term bl` alone, runs are bit-identical to the EXP-6 code (checked on a 2-epoch CPU run).
 
+**5e. EXP-9: boundary-guided cross-stage fusion (branch `exp/09-bg-csf`).**
+
+Borrowed from LB-UNet's prediction-map auxiliary module: a boundary head on each of dec3/dec4/dec5 predicts
+the lesion contour from the decoder feature (after the GAB skip is added), and that map steers the fusion.
+`--fusion bg_stage --fusion-stages shallow3` combines the five projected encoder stages as
+sum_j w_j (1 + a_j B) P_j, one learnable `a_j` per source, so a source can weigh differently on the contour
+than inside the lesion (one shared `a` would only gate the whole fused output, which is why there is no such
+mode). `--boundary-weight W` (required with `bg_stage`) adds W x the contour-band loss on the boundary heads:
+the band is dilate3x3 - erode3x3 of the mask, max-pooled to each head's grid, scored with BceDice(0.5, 1) and
+weighted 0.1 / 0.2 / 0.3 for dec3 / dec4 / dec5; `--boundary-weight 0` only logs it (a free gate). It combines
+with `--extra-term` (e.g. E3a, `--extra-term bl --extra-weight 0.095`); columns `train_extra_bnd_dec3..5` hold
+the band terms. Every configuration starts from the baseline function (zero-init heads). Runs:
+[scripts/exp09_train.sh](scripts/exp09_train.sh), per-box runner [scripts/exp09_box.sh](scripts/exp09_box.sh),
+evaluation [scripts/exp09_analyze.sh](scripts/exp09_analyze.sh) with the mechanism readouts of
+`analysis/exp09_mechanism.py` (errors by distance to the contour, source weights, knockouts, boundary-map
+quality). Checks: `python tests/test_bg_fusion.py`. The default path, every EXP-4..8 configuration and
+`--extra-term bl` are bit-identical to the EXP-8 code (2-epoch CPU runs compared file by file and tensor by
+tensor).
+
 **6. Repository layout and experiment workflow.**
 
 ```

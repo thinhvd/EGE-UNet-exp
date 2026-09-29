@@ -17,7 +17,7 @@ class setting_config:
         'gt_ds': True,
         'hpa_mode': 'learnable',  # GHPA static-prior ablation: 'learnable' (original) | 'frozen_ones' | 'none'
         'ghpa_stages': None,      # None = original placement; see models.egeunet.GHPA_PLACEMENTS ('low'/'mid'/'high')
-        'fusion_mode': 'none',    # EXP-4 cross-stage fusion: 'none' (original) | 'sum' | 'concat' | 'csaa'
+        'fusion_mode': 'none',    # EXP-4 cross-stage fusion: 'none' (original) | 'sum' | 'concat' | 'csaa' | 'sum_attn'; EXP-9: 'bg_stage'
         'fusion_stages': None,    # None = deep3 when fusion is on; see models.fusion.FUSION_STAGE_SETS
         'fusion_dim': 16,         # common channel width of the fused features
     }
@@ -225,12 +225,15 @@ def get_config(args=None):
     # GT_BceDiceLoss object and no selection_criterion is set, so train.py validates with it as before.
     loss = getattr(args, 'loss', None) or 'bcedice'
     extra_term = getattr(args, 'extra_term', None) or 'none'
-    if loss != 'bcedice' or extra_term != 'none':
+    boundary_weight = getattr(args, 'boundary_weight', None)   # EXP-9 contour-band loss; 0 is a valid value
+    if loss != 'bcedice' or extra_term != 'none' or boundary_weight is not None:
         from contour_losses import build_criterion
         config.loss_config = dict(loss=loss, extra_term=extra_term,
                                   extra_weight=getattr(args, 'extra_weight', None),
                                   snbl_tau=getattr(args, 'snbl_tau', 3.0),
                                   area_delta=getattr(args, 'area_delta', 0.05))
+        if boundary_weight is not None:   # only then, so the EXP-6/7/8 configs stay exactly as before
+            config.loss_config['boundary_weight'] = boundary_weight
         config.criterion = build_criterion(**config.loss_config)
         config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
     config.save_every = getattr(args, 'save_every', None)

@@ -127,8 +127,15 @@ def _infer_fusion_config(sd):
         return {'fusion_mode': 'none', 'fusion_stages': None, 'fusion_dim': 16}
     has_attn = any(k.startswith('fusion.attn.') for k in sd)
     has_sum = any(k.startswith('fusion.sum_w.') for k in sd)
-    mode = {(True, True): 'sum_attn', (True, False): 'csaa',
-            (False, True): 'sum', (False, False): 'concat'}[(has_attn, has_sum)]
+    alpha = [k for k in sd if k.startswith('fusion.bg_alpha.')]
+    if alpha:   # EXP-9 boundary-guided fusion: one alpha per source (5) per stage
+        n_src = int(sd['fusion.sum_w.' + alpha[0].split('.')[-1]].numel())
+        if sd[alpha[0]].numel() != n_src:
+            raise ValueError(f'{alpha[0]} has {sd[alpha[0]].numel()} values, expected one per source ({n_src})')
+        mode = 'bg_stage'
+    else:
+        mode = {(True, True): 'sum_attn', (True, False): 'csaa',
+                (False, True): 'sum', (False, False): 'concat'}[(has_attn, has_sum)]
     stages = [f'dec{i}' for i in range(1, 6) if f'fusion.heads.dec{i}.weight' in sd]
     return {
         'fusion_mode': mode,

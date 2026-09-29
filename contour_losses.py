@@ -40,6 +40,15 @@ Region term used by E2 (the ACL region term with c1 = 1, c2 = 0, normalized by t
 
 Distances are computed on the CPU with scipy from the binarized target (g >= 0.5), per sample; an
 image with no foreground (or no background) gets a zero distance map, as in Kervadec's code.
+
+EXP-9 boundary-band auxiliary loss (--boundary-weight, only with the boundary-guided fusion):
+  bnd  the boundary heads of the fusion (models/fusion.py, 'bg_stage') are trained to find the lesion
+       contour. Target: dilate3x3(g) - erode3x3(g) of the binarized mask, a ~2 px band on both sides
+       of the contour (max-pool padding is -inf, so the image frame is never marked as contour),
+       max-pooled down to each head's own grid (32 / 64 / 128 for dec3 / dec4 / dec5) so the band
+       is at least one cell wide there. Loss = 0.1 * BD(dec3) + 0.2 * BD(dec4) + 0.3 * BD(dec5),
+       BD = BceDice(wb=0.5, wd=1) on sigmoid(logit) at the head's grid (weights from LB-UNet,
+       not calibrated here). With weight 0 the terms are only logged, under no_grad.
 '''
 import math
 
@@ -48,11 +57,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils import BCELoss, GT_BceDiceLoss
+from utils import BCELoss, BceDiceLoss, GT_BceDiceLoss
 
 LOSS_MODES = ['bcedice', 'bce_region']
 EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp']
 TV_EPS = 1e-8
+BOUNDARY_STAGE_WEIGHTS = {'dec3': 0.1, 'dec4': 0.2, 'dec5': 0.3}
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -110,6 +120,26 @@ def signed_distance(target):
         if m.any() and not m.all():
             out[b, 0] = distance_transform_edt(~m) - (distance_transform_edt(m) - 1) * m
     return torch.from_numpy(out).to(target.device)
+
+
+def boundary_band(target):
+    '''EXP-9 contour band of the binarized target (B,1,H,W): dilate3x3 - erode3x3, 1 on the pixels on
+    either side of the contour. max_pool2d pads with -inf, so the image frame counts as neither
+    lesion nor background: a lesion touching the frame gets no band along it.'''
+    m = (target.detach() > 0.5).float()
+    return F.max_pool2d(m, 3, 1, 1) - (-F.max_pool2d(-m, 3, 1, 1))
+
+
+def band_at_grid(band, size):
+    '''Max-pool a full-resolution band down to a head's grid `size` (h, w): a cell is contour if any
+    of its pixels is, so the band stays at least one cell wide.'''
+    h, w = int(size[0]), int(size[1])
+    H, W = band.shape[-2:]
+    if (h, w) == (H, W):
+        return band
+    if H % h or W % w or H // h != W // w:
+        raise ValueError(f'band {H}x{W} cannot be pooled to {h}x{w}')
+    return F.max_pool2d(band, H // h, H // h)
 
 
 def distance_to_prediction(u, target, backend=None):
@@ -283,6 +313,63 @@ class WithExtraTerm(nn.Module):
         return total
 
 
+class WithBoundaryAux(nn.Module):
+    '''EXP-9: inner(gt_pre, out, target) + weight * sum_s w_s * BD(sigmoid(logit_s), band_s).
+
+    The boundary logits come from the boundary-guided fusion as gt_pre.boundary (a
+    models.fusion.DeepSupervisionOutputs); `inner` is the usual criterion (GT_BceDiceLoss or a
+    WithExtraTerm around it). Keeps a running mean of every unweighted band term, merged with the
+    inner criterion's, so train.py logs them as train_extra_* columns. With weight 0 the band terms
+    are computed under no_grad for the log only and the result is inner's value, unchanged.'''
+    def __init__(self, inner, weight, stage_weights=None):
+        super().__init__()
+        self.inner = inner
+        self.weight = float(weight)
+        self.stage_weights = dict(stage_weights or BOUNDARY_STAGE_WEIGHTS)
+        self.bd = BceDiceLoss(wb=0.5, wd=1)
+        self.bnd_names = [f'bnd_{s}' for s in self.stage_weights]
+        self.names = list(getattr(inner, 'names', [])) + self.bnd_names
+        self.reset_stats()
+
+    def reset_stats(self):
+        if hasattr(self.inner, 'reset_stats'):
+            self.inner.reset_stats()
+        self._sums, self._n = [0.0] * len(self.bnd_names), 0
+
+    def epoch_means(self):
+        out = dict(self.inner.epoch_means()) if hasattr(self.inner, 'epoch_means') else {}
+        out.update({n: (s / self._n if self._n else float('nan')) for n, s in zip(self.bnd_names, self._sums)})
+        return out
+
+    def epoch_mean(self):
+        return self.epoch_means()[self.names[0]]
+
+    def band_terms(self, boundary, target):
+        '''Unweighted BD per stage, in stage_weights order (also used by analysis/exp09_mechanism.py).'''
+        band = boundary_band(target)
+        return [self.bd(torch.sigmoid(boundary[s]), band_at_grid(band, boundary[s].shape[-2:]))
+                for s in self.stage_weights]
+
+    def forward(self, gt_pre, out, target):
+        boundary = getattr(gt_pre, 'boundary', None)
+        if boundary is None or set(boundary) != set(self.stage_weights):
+            raise ValueError('the boundary-band loss needs the boundary logits of the boundary-guided fusion '
+                             f'for stages {sorted(self.stage_weights)}; got '
+                             f'{None if boundary is None else sorted(boundary)}')
+        total = self.inner(gt_pre, out, target)
+        if self.weight == 0:
+            with torch.no_grad():
+                terms = self.band_terms(boundary, target)
+        else:
+            terms = self.band_terms(boundary, target)
+        for k, t in enumerate(terms):
+            self._sums[k] += float(t.detach())
+        self._n += 1
+        if self.weight != 0:
+            total = total + self.weight * sum(w * t for w, t in zip(self.stage_weights.values(), terms))
+        return total
+
+
 def parse_terms(extra_term='none', extra_weight=None):
     '''"bl,fn_dp" and "0.095,0.35" (or a float) -> [('bl', 0.095), ('fn_dp', 0.35)]; [] for none.'''
     names = [t.strip() for t in str(extra_term).split(',') if t.strip()]
@@ -302,7 +389,7 @@ def parse_terms(extra_term='none', extra_weight=None):
     return list(zip(names, weights))
 
 
-def describe(loss='bcedice', extra_term='none', extra_weight=None, **kw):
+def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weight=None, **kw):
     terms = parse_terms(extra_term, extra_weight)
     s = loss + ''.join(f' + {w:g} * {n}' for n, w in terms)
     names = [n for n, _ in terms]
@@ -310,6 +397,10 @@ def describe(loss='bcedice', extra_term='none', extra_weight=None, **kw):
         s += f' (tau {kw.get("snbl_tau", 3.0)})'
     if 'area' in names:
         s += f' (delta {kw.get("area_delta", 0.05)})'
+    if boundary_weight is not None:
+        bw = float(boundary_weight)
+        s += (f' + {bw:g} * bnd (0.1*dec3 + 0.2*dec4 + 0.3*dec5, BceDice(0.5,1) on the contour band per head grid)'
+              if bw != 0 else ' (+ bnd contour-band loss logged only, weight 0)')
     return s
 
 
@@ -321,12 +412,18 @@ def make_term(name, snbl_tau=3.0, area_delta=0.05):
     return TERM_CLASSES[name]()
 
 
-def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05):
-    '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1).'''
+def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05,
+                    boundary_weight=None):
+    '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1); extra terms
+    alone return EXP-6/7's WithExtraTerm; a boundary_weight (EXP-9, 0 allowed) wraps either in
+    WithBoundaryAux.'''
     if loss not in LOSS_MODES:
         raise ValueError(f'unknown loss {loss!r}; choose from {LOSS_MODES}')
     terms = parse_terms(extra_term, extra_weight)
     base = GT_BceDiceLoss(wb=1, wd=1) if loss == 'bcedice' else GT_BceRegionLoss(wb=1, wr=1)
-    if not terms:
-        return base
-    return WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta), w) for n, w in terms])
+    crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta), w) for n, w in terms])
+    if boundary_weight is None:
+        return crit
+    if float(boundary_weight) < 0:
+        raise ValueError(f'boundary_weight must be >= 0, got {boundary_weight}')
+    return WithBoundaryAux(crit, boundary_weight)
