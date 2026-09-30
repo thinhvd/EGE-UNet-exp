@@ -6,6 +6,7 @@ from torch.nn.init import trunc_normal_
 import math
 
 from models.fusion import CrossStageFusion, DeepSupervisionOutputs, FUSION_MODES, FUSION_STAGE_SETS
+from models.refine import Dec5BoundaryResidual, REFINE_MODES
 
 
 class DepthWiseConv2d(nn.Module):
@@ -192,7 +193,7 @@ class EGEUNet(nn.Module):
     
     def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True,
                  hpa_mode='learnable', ghpa_stages=None,
-                 fusion_mode='none', fusion_stages=None, fusion_dim=16):
+                 fusion_mode='none', fusion_stages=None, fusion_dim=16, refine_mode='none'):
         super().__init__()
 
         self.bridge = bridge
@@ -274,6 +275,9 @@ class EGEUNet(nn.Module):
         self.fusion_mode = fusion_mode
         self.fusion_stages = None
         self.boundary_guided = False
+        if refine_mode not in REFINE_MODES:
+            raise ValueError(f'refine_mode must be one of {REFINE_MODES}, got {refine_mode!r}')
+        self.refine_mode = refine_mode
 
         self.apply(self._init_weights)
 
@@ -295,6 +299,21 @@ class EGEUNet(nn.Module):
                 raise ValueError('boundary-guided fusion returns its boundary maps with the deep-supervision '
                                  'outputs, so it needs gt_ds=True')
             print(f'cross-stage fusion = {fusion_mode} on {self.fusion_stages} (dim {fusion_dim})')
+
+        # EXP-10 boundary residual refinement at dec5 (models/refine.py). Also built after apply().
+        # Its constructor and init run inside fork_rng, so the global RNG continues exactly as in the
+        # fusion-only model: same data order and augmentation coins, the arms differ only through
+        # the residual's gradient. delta is then zeroed, so the output starts as the fusion-only one.
+        if refine_mode != 'none':
+            if fusion_mode != 'sum' or 'dec5' not in self.fusion_stages:
+                raise ValueError("refine needs --fusion sum with 'dec5' among the fusion stages")
+            if not gt_ds:
+                raise ValueError('refine returns its boundary logit with the deep-supervision outputs, so it needs gt_ds=True')
+            with torch.random.fork_rng(devices=[]):
+                self.refine = Dec5BoundaryResidual(c_list[0], fusion_dim, refine_mode)
+                self.refine.apply(self._init_weights)
+            self.refine.zero_init_delta()
+            print(f'dec5 boundary residual refinement = {refine_mode}')
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -336,10 +355,12 @@ class EGEUNet(nn.Module):
         # exactly what it read in the baseline.
         # EXP-9 (boundary-guided): only the projections are computed here; each target stage then
         # reads its boundary map from its decoder feature after the GAB add, fuses and adds.
-        fuse, p, bnd = {}, None, {}
+        fuse, p, bnd, proj = {}, None, {}, None
         if self.fusion_mode != 'none':
             if self.boundary_guided:
                 p = self.fusion.project((t1, t2, t3, t4, t5))
+            elif self.refine_mode != 'none':   # EXP-10: same fusion, plus its projections for the residual
+                fuse, proj = self.fusion((t1, t2, t3, t4, t5), return_proj=True)
             else:
                 fuse = self.fusion((t1, t2, t3, t4, t5))
 
@@ -403,11 +424,21 @@ class EGEUNet(nn.Module):
             f, bnd['dec5'] = self.fusion.guided_stage('dec5', p, out1)
             out1 = out1 + f
         
-        out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
+        if self.refine_mode != 'none':
+            # EXP-10: residual correction on the logit at dec5's grid, before the final upsampling
+            z = self.final(out1)
+            gdz, _, lb = self.refine(out1, proj[0], proj[1])
+            if self.refine.enabled:
+                z = z + gdz
+            if lb is not None:
+                bnd['dec5'] = lb
+            out0 = F.interpolate(z, scale_factor=(2,2), mode='bilinear', align_corners=True)
+        else:
+            out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
         
         if self.gt_ds:
             gt_pres = (torch.sigmoid(gt_pre5), torch.sigmoid(gt_pre4), torch.sigmoid(gt_pre3), torch.sigmoid(gt_pre2), torch.sigmoid(gt_pre1))
-            if bnd:   # EXP-9 only; every other configuration returns the plain tuple as before
+            if bnd:   # EXP-9 / EXP-10 gate only; every other configuration returns the plain tuple as before
                 gt_pres = DeepSupervisionOutputs(gt_pres, boundary=bnd)
             return gt_pres, torch.sigmoid(out0)
         else:

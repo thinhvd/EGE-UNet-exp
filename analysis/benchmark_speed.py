@@ -143,6 +143,7 @@ def model_from_flags(args, device):
         'fusion_mode': args.fusion,
         'fusion_stages': FUSION_STAGE_SETS[args.fusion_stages] if args.fusion_stages else None,
         'fusion_dim': args.fusion_dim,
+        'refine_mode': args.refine,
     }
     model = EGEUNet(**cfg)
     return model.to(device).eval(), cfg, None
@@ -168,6 +169,7 @@ def main():
                     choices=['none', 'sum', 'concat', 'csaa', 'sum_attn', 'bg_stage'])
     ap.add_argument('--fusion-stages', type=str, default=None, choices=['deep3', 'all5', 'shallow3'])
     ap.add_argument('--fusion-dim', type=int, default=16)
+    ap.add_argument('--refine', type=str, default='none', choices=['none', 'gate', 'plain'])
     ap.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'])
     ap.add_argument('--batch-sizes', type=str, default='1,8')
     ap.add_argument('--input-size', type=int, default=256)
@@ -202,7 +204,8 @@ def main():
     else:
         label = args.label[0] if args.label else (
             f'{args.hpa_mode}' if args.fusion == 'none'
-            else f'fuse-{args.fusion}-{args.fusion_stages or "deep3"}-d{args.fusion_dim}')
+            else f'fuse-{args.fusion}-{args.fusion_stages or "deep3"}-d{args.fusion_dim}'
+            + (f'_brr-{args.refine}' if args.refine != 'none' else ''))
         targets.append((label, None))
 
     rows = []

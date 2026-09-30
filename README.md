@@ -189,6 +189,22 @@ quality). Checks: `python tests/test_bg_fusion.py`. The default path, every EXP-
 `--extra-term bl` are bit-identical to the EXP-8 code (2-epoch CPU runs compared file by file and tensor by
 tensor).
 
+**5f. EXP-10: dec5 boundary residual refinement (branch `exp/10-dec5-brr`).**
+
+EXP-9's fusion branch reached only 1.6-3 % of the decoder feature at dec5, so it could not move the mask.
+`--refine {gate,plain}` (with `--fusion sum --fusion-stages shallow3`) corrects the segmentation logit itself at
+dec5: z = z_base + B * dz, where dz comes from a small head (1x1 conv + GroupNorm + GELU + zero-initialized 3x3
+conv) on the dec5 feature and the fusion's own projections of the two shallowest encoder stages, and B is a
+boundary map from a 1x1 head (`gate`; `plain` drops B). `--boundary-weight W --refine-radius R` supervises B with
+the contour zone (every pixel within R px, Euclidean, of the contour), max-pooled to the 128 grid and scored
+with BceDice(0.5, 1); its per-epoch mean is the column `train_extra_bnd_dec5`. The refinement module is built
+inside `torch.random.fork_rng`, so arms with and without it share data order and augmentation. Implementation in
+[models/refine.py](models/refine.py); runs [scripts/exp10_train.sh](scripts/exp10_train.sh), per-box runner
+[scripts/exp10_box.sh](scripts/exp10_box.sh), evaluation [scripts/exp10_analyze.sh](scripts/exp10_analyze.sh)
+with `analysis/exp10_mechanism.py` (same-checkpoint knockouts of the residual and of the gate, boundary-map
+quality, leverage, errors by distance to the contour). Checks: `python tests/test_refine.py`. Every EXP-4..9
+configuration is bit-identical to the EXP-9 code.
+
 **6. Repository layout and experiment workflow.**
 
 ```

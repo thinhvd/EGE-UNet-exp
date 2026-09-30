@@ -221,6 +221,9 @@ def get_config(args=None):
     fusion_dim = getattr(args, 'fusion_dim', None)
     if fusion_dim is not None:
         config.model_config['fusion_dim'] = fusion_dim
+    refine = getattr(args, 'refine', None)   # EXP-10 dec5 boundary residual refinement
+    if refine is not None:
+        config.model_config['refine_mode'] = refine
     # EXP-6 loss variants (contour_losses.py). Without the flags config.criterion stays the original
     # GT_BceDiceLoss object and no selection_criterion is set, so train.py validates with it as before.
     loss = getattr(args, 'loss', None) or 'bcedice'
@@ -234,6 +237,9 @@ def get_config(args=None):
                                   area_delta=getattr(args, 'area_delta', 0.05))
         if boundary_weight is not None:   # only then, so the EXP-6/7/8 configs stay exactly as before
             config.loss_config['boundary_weight'] = boundary_weight
+            if refine == 'gate':   # EXP-10: the loss supervises the dec5 head with the contour zone
+                config.loss_config['boundary_stages'] = {'dec5': 1.0}
+                config.loss_config['boundary_radius'] = getattr(args, 'refine_radius', 10)
         config.criterion = build_criterion(**config.loss_config)
         config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
     config.save_every = getattr(args, 'save_every', None)

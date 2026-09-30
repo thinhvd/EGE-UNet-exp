@@ -242,10 +242,11 @@ class CrossStageFusion(nn.Module):
         logit = self.bnd_heads[s](feat)
         return self.fuse_stage(s, p, feat.shape[2:4], torch.sigmoid(logit)), logit
 
-    def forward(self, feats):
+    def forward(self, feats, return_proj=False):
         """EXP-4 modes: returns {stage: tensor} with one entry per target stage, each already shaped
         like that stage's decoder output. The boundary-guided mode needs decoder features and is
-        driven stage by stage from EGEUNet.forward instead."""
+        driven stage by stage from EGEUNet.forward instead. With return_proj the projected source
+        maps are returned too (EXP-10 reads P1 / P2 from them); the computation is the same."""
         if self.boundary_guided:
             raise RuntimeError('boundary-guided fusion is driven per stage via project() / guided_stage()')
         p = self.project(feats)
@@ -253,7 +254,7 @@ class CrossStageFusion(nn.Module):
         for s in self.target_stages:
             size = feats[_STAGE_SOURCE_IDX[s]].shape[2:4]
             out[s] = self.fuse_stage(s, p, size)
-        return out
+        return (out, p) if return_proj else out
 
 
 class DeepSupervisionOutputs(tuple):

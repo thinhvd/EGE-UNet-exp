@@ -113,7 +113,16 @@ def parse_args():
     parser.add_argument('--boundary-weight', type=float, default=None,
                         help='EXP-9: weight of the contour-band loss on the boundary heads of --fusion bg_stage '
                              '(required with it; 0 = the band loss is only logged, the boundary heads then '
-                             'learn through the fusion alone)')
+                             'learn through the fusion alone). EXP-10: weight of the contour-zone loss on the '
+                             'dec5 head of --refine gate (required with it)')
+    parser.add_argument('--refine', type=str, default=None, choices=['none', 'gate', 'plain'],
+                        help='EXP-10 dec5 boundary residual refinement on the segmentation logit (needs '
+                             '--fusion sum --fusion-stages shallow3): gate = residual times the map of a '
+                             'boundary head trained on the contour zone; plain = the same residual, no gate, '
+                             'no head. Default: config value (none)')
+    parser.add_argument('--refine-radius', type=int, default=10,
+                        help='EXP-10: radius in px (at 256) of the contour zone that supervises the dec5 head '
+                             '(default 10)')
     parser.add_argument('--save-every', type=int, default=None,
                         help='also keep the weights of every N-th epoch from --save-from on '
                              '(checkpoints/epochNNN.pth), to measure how much the chosen epoch matters. '
@@ -128,8 +137,20 @@ def parse_args():
             parser.error('--fusion bg_stage needs an explicit --boundary-weight (0 = band loss logged only)')
         if args.fusion_stages != 'shallow3':
             parser.error('--fusion bg_stage needs --fusion-stages shallow3')
-    elif args.boundary_weight is not None:
-        parser.error('--boundary-weight only goes with --fusion bg_stage')
+    # EXP-10: the residual reads the sum fusion's projections at dec5; only the gated variant has a
+    # head to supervise.
+    refine = args.refine if args.refine and args.refine != 'none' else None
+    if refine is not None:
+        if args.fusion != 'sum' or args.fusion_stages != 'shallow3':
+            parser.error('--refine needs --fusion sum --fusion-stages shallow3')
+        if refine == 'gate' and args.boundary_weight is None:
+            parser.error('--refine gate needs an explicit --boundary-weight (0 = zone loss logged only)')
+        if refine == 'plain' and args.boundary_weight is not None:
+            parser.error('--refine plain has no boundary head; drop --boundary-weight')
+        if args.refine_radius <= 0:
+            parser.error('--refine-radius must be > 0')
+    if args.boundary_weight is not None and args.fusion != 'bg_stage' and refine != 'gate':
+        parser.error('--boundary-weight only goes with --fusion bg_stage or --refine gate')
     if args.boundary_weight is not None and args.boundary_weight < 0:
         parser.error('--boundary-weight must be >= 0')
     return args
@@ -202,6 +223,7 @@ def main(config):
                         fusion_mode=model_cfg.get('fusion_mode', 'none'),
                         fusion_stages=model_cfg.get('fusion_stages'),
                         fusion_dim=model_cfg.get('fusion_dim', 16),
+                        refine_mode=model_cfg.get('refine_mode', 'none'),
                         )
     else: raise Exception('network in not right!')
     model = model.to(config.device)
@@ -210,7 +232,8 @@ def main(config):
     log_info = (f'hpa_mode: {model_cfg.get("hpa_mode", "learnable")}, '
                 f'ghpa_stages: {model.ghpa_stages}, '
                 f'fusion: {model.fusion_mode}/{model.fusion_stages}/d{model_cfg.get("fusion_dim", 16)}, '
-                f'params: {n_total} total / {n_trainable} trainable')
+                + (f'refine: {model.refine_mode}, ' if model.refine_mode != 'none' else '')
+                + f'params: {n_total} total / {n_trainable} trainable')
     print(log_info)
     logger.info(log_info)
     # EXP-5: record the run's rotation angle (reading an attribute consumes no randomness).
@@ -232,8 +255,9 @@ def main(config):
     # this is the training criterion itself.
     select_criterion = getattr(config, 'selection_criterion', criterion)
     has_extra = hasattr(criterion, 'epoch_means')
-    # one extra term keeps EXP-6's single 'train_extra' column; several get one column each
-    extra_fields = (['train_extra'] if has_extra and len(criterion.names) == 1 else
+    # one extra term keeps EXP-6's single 'train_extra' column; several get one column each, and so
+    # does a lone boundary-head term (EXP-10), whose name says which head it belongs to
+    extra_fields = (['train_extra'] if has_extra and len(criterion.names) == 1 and not criterion.names[0].startswith('bnd_') else
                     [f'train_extra_{n}' for n in criterion.names] if has_extra else [])
     log_info = (f'loss: {describe(**getattr(config, "loss_config", {}))}; checkpoint selection: '
                 f'{"original GT_BceDiceLoss" if select_criterion is not criterion else "same loss"}')

@@ -118,6 +118,9 @@ def infer_model_config(sd):
         'hpa_mode': 'learnable' if any(k.endswith('params_xy') for k in sd) else 'none',
         'ghpa_stages': ghpa_stages or None,
         **_infer_fusion_config(sd),
+        # EXP-10 dec5 boundary residual refinement: only the gated variant has a boundary head
+        'refine_mode': ('gate' if any(k.startswith('refine.bnd_head.') for k in sd)
+                        else 'plain' if any(k.startswith('refine.') for k in sd) else 'none'),
     }
 
 
