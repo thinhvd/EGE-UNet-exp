@@ -7,6 +7,8 @@ import math
 
 from models.fusion import CrossStageFusion, DeepSupervisionOutputs, FUSION_MODES, FUSION_STAGE_SETS
 from models.refine import Dec5BoundaryResidual, REFINE_MODES
+from models.completion import RegionCompletion, COMPLETE_MODES
+from models.propagation import CorePropagation, PROPAGATE_MODES
 
 
 class DepthWiseConv2d(nn.Module):
@@ -193,7 +195,10 @@ class EGEUNet(nn.Module):
     
     def __init__(self, num_classes=1, input_channels=3, c_list=[8,16,24,32,48,64], bridge=True, gt_ds=True,
                  hpa_mode='learnable', ghpa_stages=None,
-                 fusion_mode='none', fusion_stages=None, fusion_dim=16, refine_mode='none'):
+                 fusion_mode='none', fusion_stages=None, fusion_dim=16, refine_mode='none',
+                 complete_mode='none', complete_steps=32, complete_seed=0.9,
+                 propagate_mode='none', propagate_steps=32, propagate_seed=0.9, propagate_tau=0.3,
+                 propagate_kappa=10.0, propagate_beta=1.0):
         super().__init__()
 
         self.bridge = bridge
@@ -278,6 +283,12 @@ class EGEUNet(nn.Module):
         if refine_mode not in REFINE_MODES:
             raise ValueError(f'refine_mode must be one of {REFINE_MODES}, got {refine_mode!r}')
         self.refine_mode = refine_mode
+        if complete_mode not in COMPLETE_MODES:
+            raise ValueError(f'complete_mode must be one of {COMPLETE_MODES}, got {complete_mode!r}')
+        self.complete_mode = complete_mode
+        if propagate_mode not in PROPAGATE_MODES:
+            raise ValueError(f'propagate_mode must be one of {PROPAGATE_MODES}, got {propagate_mode!r}')
+        self.propagate_mode = propagate_mode
 
         self.apply(self._init_weights)
 
@@ -314,6 +325,41 @@ class EGEUNet(nn.Module):
                 self.refine.apply(self._init_weights)
             self.refine.zero_init_delta()
             print(f'dec5 boundary residual refinement = {refine_mode}')
+
+        # EXP-11 boundary-constrained region completion at dec5 (models/completion.py). Same recipe as
+        # EXP-10: built after apply() inside fork_rng (the global RNG, hence data order and augmentation,
+        # continues as in the fusion-only model), then set_init() opens the growth and puts alpha at
+        # softplus(-4), so the output starts within 0.018 logit of the fusion-only one.
+        if complete_mode != 'none':
+            if fusion_mode != 'sum' or 'dec5' not in self.fusion_stages:
+                raise ValueError("complete needs --fusion sum with 'dec5' among the fusion stages")
+            if refine_mode != 'none':
+                raise ValueError('complete and refine both act on the dec5 logit; use one of them')
+            if not gt_ds:
+                raise ValueError('complete returns its barrier logit with the deep-supervision outputs, so it needs gt_ds=True')
+            with torch.random.fork_rng(devices=[]):
+                self.complete = RegionCompletion(c_list[0], fusion_dim, complete_mode, complete_steps, complete_seed)
+                self.complete.apply(self._init_weights)
+            self.complete.set_init()
+            print(f'dec5 region completion = {complete_mode} (steps {complete_steps}, seed p >= {complete_seed})')
+
+        # EXP-13 core-to-region propagation along learned edges at dec5 (models/propagation.py). Same recipe:
+        # built after apply() inside fork_rng (global RNG, hence data order and augmentation, as in the
+        # fusion-only model); set_init() starts every edge at S = 0.12 so the start does not flood.
+        if propagate_mode != 'none':
+            if fusion_mode != 'sum' or 'dec5' not in self.fusion_stages:
+                raise ValueError("propagate needs --fusion sum with 'dec5' among the fusion stages")
+            if refine_mode != 'none' or complete_mode != 'none':
+                raise ValueError('propagate, complete and refine all act on the dec5 output; use one of them')
+            if not gt_ds:
+                raise ValueError('propagate returns its edge logits with the deep-supervision outputs, so it needs gt_ds=True')
+            with torch.random.fork_rng(devices=[]):
+                self.propagate = CorePropagation(c_list[0], fusion_dim, propagate_mode, propagate_steps, propagate_seed,
+                                                 propagate_tau, propagate_kappa, propagate_beta)
+                self.propagate.apply(self._init_weights)
+            self.propagate.set_init()
+            print(f'dec5 core-to-region propagation = {propagate_mode} (steps {propagate_steps}, seed p >= {propagate_seed}, '
+                  f'cap tau {propagate_tau} kappa {propagate_kappa}, beta {propagate_beta})')
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -355,11 +401,11 @@ class EGEUNet(nn.Module):
         # exactly what it read in the baseline.
         # EXP-9 (boundary-guided): only the projections are computed here; each target stage then
         # reads its boundary map from its decoder feature after the GAB add, fuses and adds.
-        fuse, p, bnd, proj = {}, None, {}, None
+        fuse, p, bnd, proj, prob = {}, None, {}, None, None
         if self.fusion_mode != 'none':
             if self.boundary_guided:
                 p = self.fusion.project((t1, t2, t3, t4, t5))
-            elif self.refine_mode != 'none':   # EXP-10: same fusion, plus its projections for the residual
+            elif self.refine_mode != 'none' or self.complete_mode != 'none' or self.propagate_mode != 'none':   # EXP-10/11/13: plus projections
                 fuse, proj = self.fusion((t1, t2, t3, t4, t5), return_proj=True)
             else:
                 fuse = self.fusion((t1, t2, t3, t4, t5))
@@ -433,13 +479,30 @@ class EGEUNet(nn.Module):
             if lb is not None:
                 bnd['dec5'] = lb
             out0 = F.interpolate(z, scale_factor=(2,2), mode='bilinear', align_corners=True)
+        elif self.complete_mode != 'none':
+            # EXP-11: grow the confident core at dec5's grid and add the grown part to the logit
+            z = self.final(out1)
+            add, ring_logit, _, _, _ = self.complete(z, out1, proj)
+            if self.complete.enabled:
+                z = z + add
+            bnd['ring'] = ring_logit
+            out0 = F.interpolate(z, scale_factor=(2,2), mode='bilinear', align_corners=True)
+        elif self.propagate_mode != 'none':
+            # EXP-13: propagate the confident core along learned edges; the grown part joins by probabilistic OR at 256
+            z = self.final(out1)
+            out0 = F.interpolate(z, scale_factor=(2,2), mode='bilinear', align_corners=True)
+            if self.propagate.enabled:
+                res = self.propagate(z, out1, proj, F.avg_pool2d(x, 2))
+                bnd.update({'aff': res['s_logit'], 'prop': res['r'], 'seed': res['seed'], 'contrast': res['contrast']})
+                grown = F.interpolate(res['g'], scale_factor=(2,2), mode='bilinear', align_corners=True)
+                prob = 1 - (1 - torch.sigmoid(out0)) * (1 - grown)
         else:
             out0 = F.interpolate(self.final(out1),scale_factor=(2,2),mode ='bilinear',align_corners=True) # b, num_class, H, W
         
         if self.gt_ds:
             gt_pres = (torch.sigmoid(gt_pre5), torch.sigmoid(gt_pre4), torch.sigmoid(gt_pre3), torch.sigmoid(gt_pre2), torch.sigmoid(gt_pre1))
-            if bnd:   # EXP-9 / EXP-10 gate only; every other configuration returns the plain tuple as before
+            if bnd:   # EXP-9 / EXP-10 gate / EXP-11 only; every other configuration returns the plain tuple as before
                 gt_pres = DeepSupervisionOutputs(gt_pres, boundary=bnd)
-            return gt_pres, torch.sigmoid(out0)
+            return gt_pres, (torch.sigmoid(out0) if prob is None else prob)
         else:
             return torch.sigmoid(out0)

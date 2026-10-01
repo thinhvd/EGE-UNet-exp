@@ -24,6 +24,19 @@ d_P / N. The pre-registered rule makes the two totals equal:
   python analysis/calibrate_loss_weights.py --mass-balance --beta-bl 0.095 \
       --checkpoint results/EGE-UNet-results-exp6/egeunet_isic17_learnable_loss-bl_s42 \
       --dataset isic17 --data-path data/data_isic1718/isic2017 --out .../mass_balance_isic17.json
+
+EXP-11, --hp-balance: weight of the hard-positive term (contour_losses.HardPositive) on a fusion-only
+checkpoint (EXP-10 B1). M = the deep lesion pixels (distance to the background > --hp-radius) that the
+checkpoint misses (u < 0.5). Pre-registered push balance, k = 1: at the checkpoint, on M, hp pushes the logits
+up as hard in total as the BceDice of the final output does:
+    lambda = k * sum_M |d BceDice / dz| / sum_M |d hp / dz|,   d/dz = d/du * u(1-u),
+summed over every train batch (batch size as in training), not a median. Also printed: the batches with
+|M| >= 100, the share of hp's push that lands on deep pixels the checkpoint already paints (H minus M),
+and the push of fn_dp at its EXP-7 weight 0.51 on the same M, for comparison.
+
+  python analysis/calibrate_loss_weights.py --hp-balance \
+      --checkpoint results/EGE-UNet-results-exp10/egeunet_isic17_learnable_fuse-sum-shallow3-d8_s42 \
+      --dataset isic17 --data-path data/data_isic1718/isic2017 --out .../hp_balance_isic17.json
 '''
 import os
 import sys
@@ -51,6 +64,11 @@ def parse_args():
     p.add_argument('--out', default=None, help='json path for the table')
     p.add_argument('--mass-balance', action='store_true', help='EXP-7: weight of fn_dp from total push balance')
     p.add_argument('--beta-bl', type=float, default=0.095)
+    p.add_argument('--hp-balance', action='store_true', help='EXP-11: weight of hp from the push balance on missed deep pixels')
+    p.add_argument('--hp-radius', type=float, default=10.0)
+    p.add_argument('--hp-gamma', type=float, default=2.0)
+    p.add_argument('--k', type=float, default=1.0, help='hp-balance: target ratio of the two pushes')
+    p.add_argument('--fn-dp-weight', type=float, default=0.51)
     return p.parse_args()
 
 
@@ -93,6 +111,48 @@ def mass_balance(a, model, loader):
     return table
 
 
+def logit_grad(loss_fn, u, g):
+    '''|d loss / d z| per pixel, z the logit of u: the gradient with respect to u times u(1-u).'''
+    u = u.detach().clone().requires_grad_(True)
+    (grad,) = torch.autograd.grad(loss_fn(u, g), u)
+    return (grad * u.detach() * (1 - u.detach())).abs()
+
+
+def hp_balance(a, model, loader):
+    import contour_losses as L
+    from utils import BceDiceLoss
+    base, hp, fndp = BceDiceLoss(wb=1, wd=1), L.HardPositive(a.hp_radius, a.hp_gamma), L.FNDistance()
+    tot = dict(base_M=0.0, hp_M=0.0, hp_H=0.0, fndp_M=0.0, n_M=0, n_H=0, n_batches=0, batches_M100=0)
+    for img, msk in loader:
+        with torch.no_grad():
+            _, u = model(img.float())
+        g = msk.float()
+        h = L.deep_positive_mask(g, a.hp_radius) > 0
+        m = h & (u < 0.5)
+        gb, gh, gf = logit_grad(base, u, g), logit_grad(hp, u, g), logit_grad(fndp, u, g)
+        tot['base_M'] += float(gb[m].sum())
+        tot['hp_M'] += float(gh[m].sum())
+        tot['hp_H'] += float(gh[h].sum())
+        tot['fndp_M'] += float(gf[m].sum())
+        tot['n_M'] += int(m.sum())
+        tot['n_H'] += int(h.sum())
+        tot['n_batches'] += 1
+        tot['batches_M100'] += int(m.sum() >= 100)
+    lam = a.k * tot['base_M'] / tot['hp_M'] if tot['hp_M'] > 0 else float('nan')
+    table = {'checkpoint': C_resolve(a.checkpoint), 'dataset': a.dataset, 'hp_radius': a.hp_radius, 'hp_gamma': a.hp_gamma,
+             'k': a.k, **tot, 'lambda': lam,
+             'hp_push_share_on_painted_deep_pct': 100 * (1 - tot['hp_M'] / tot['hp_H']) if tot['hp_H'] else float('nan'),
+             'fn_dp_push_on_M_vs_bcedice': a.fn_dp_weight * tot['fndp_M'] / tot['base_M'] if tot['base_M'] else float('nan'),
+             'fn_dp_weight': a.fn_dp_weight}
+    print(f'{a.dataset}: {tot["n_batches"]} train batches, {tot["batches_M100"]} with |M| >= 100; '
+          f'M = {tot["n_M"]} missed deep px of {tot["n_H"]} deep px')
+    print(f'  logit-space push on M: BceDice {tot["base_M"]:.4g}, hp {tot["hp_M"]:.4g}  ->  lambda = {a.k:g} x '
+          f'{tot["base_M"]:.4g} / {tot["hp_M"]:.4g} = {lam:.4f}')
+    print(f'  share of hp push on deep pixels already painted (H minus M): {table["hp_push_share_on_painted_deep_pct"]:.1f} %')
+    print(f'  fn_dp at {a.fn_dp_weight} pushes {table["fn_dp_push_on_M_vs_bcedice"]:.3f} x BceDice on M')
+    return table
+
+
 def C_resolve(path):
     from analysis import common as C
     return C.resolve_checkpoint(path)
@@ -117,8 +177,8 @@ def main():
     model, _ = C.build_model(sd, 'cpu', None, strict=True)
     model.eval()
 
-    if a.mass_balance:
-        table = mass_balance(a, model, loader)
+    if a.mass_balance or a.hp_balance:
+        table = mass_balance(a, model, loader) if a.mass_balance else hp_balance(a, model, loader)
         if a.out:
             os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
             with open(a.out, 'w') as f:

@@ -121,7 +121,39 @@ def infer_model_config(sd):
         # EXP-10 dec5 boundary residual refinement: only the gated variant has a boundary head
         'refine_mode': ('gate' if any(k.startswith('refine.bnd_head.') for k in sd)
                         else 'plain' if any(k.startswith('refine.') for k in sd) else 'none'),
+        **_infer_complete_config(sd),
+        **_infer_propagate_config(sd),
     }
+
+
+def _infer_propagate_config(sd):
+    '''EXP-13 core-to-region propagation (models/propagation.py): mode, steps, seed, cap and beta are read from the
+    buffers the module stores (the three modes have the same parameters).'''
+    if not any(k.startswith('propagate.') for k in sd):
+        return {}
+    from models.propagation import _MODE_ID
+    keys = {'mode_id': None, 'n_steps': None, 'seed_threshold': None, 'cap_tau': None, 'cap_kappa': None, 'edge_beta': None}
+    for k in keys:
+        if f'propagate.{k}' not in sd:
+            raise ValueError(f'propagation checkpoint without its provenance buffer propagate.{k}')
+    mode = {v: k for k, v in _MODE_ID.items()}[int(sd['propagate.mode_id'])]
+    f = lambda k: round(float(sd[f'propagate.{k}']), 6)
+    return {'propagate_mode': mode, 'propagate_steps': int(sd['propagate.n_steps']), 'propagate_seed': f('seed_threshold'),
+            'propagate_tau': f('cap_tau'), 'propagate_kappa': f('cap_kappa'), 'propagate_beta': f('edge_beta')}
+
+
+def _infer_complete_config(sd):
+    '''EXP-11 region completion (models/completion.py): full and nobarrier have the same parameters, so the
+    mode, step count and seed threshold are read from the buffers the module stores for this purpose.'''
+    if not any(k.startswith('complete.') for k in sd):
+        return {}
+    from models.completion import _MODE_ID
+    need = ('complete.mode_id', 'complete.n_steps', 'complete.seed_threshold')
+    if not all(k in sd for k in need):
+        raise ValueError(f'region-completion checkpoint without its provenance buffers {need}')
+    mode = {v: k for k, v in _MODE_ID.items()}[int(sd['complete.mode_id'])]
+    return {'complete_mode': mode, 'complete_steps': int(sd['complete.n_steps']),
+            'complete_seed': round(float(sd['complete.seed_threshold']), 6)}
 
 
 def _infer_fusion_config(sd):

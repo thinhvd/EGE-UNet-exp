@@ -224,22 +224,45 @@ def get_config(args=None):
     refine = getattr(args, 'refine', None)   # EXP-10 dec5 boundary residual refinement
     if refine is not None:
         config.model_config['refine_mode'] = refine
+    complete = getattr(args, 'complete', None)   # EXP-11 dec5 region completion; keys only when used
+    if complete is not None:
+        config.model_config['complete_mode'] = complete
+        if complete != 'none':
+            config.model_config['complete_steps'] = getattr(args, 'complete_steps', 32)
+            config.model_config['complete_seed'] = getattr(args, 'complete_seed', 0.9)
+    propagate = getattr(args, 'propagate', None)   # EXP-13 dec5 core-to-region propagation; keys only when used
+    if propagate is not None:
+        config.model_config['propagate_mode'] = propagate
+        if propagate != 'none':
+            for k in ('steps', 'seed', 'tau', 'kappa', 'beta'):
+                config.model_config[f'propagate_{k}'] = getattr(args, f'propagate_{k}')
     # EXP-6 loss variants (contour_losses.py). Without the flags config.criterion stays the original
     # GT_BceDiceLoss object and no selection_criterion is set, so train.py validates with it as before.
     loss = getattr(args, 'loss', None) or 'bcedice'
     extra_term = getattr(args, 'extra_term', None) or 'none'
     boundary_weight = getattr(args, 'boundary_weight', None)   # EXP-9 contour-band loss; 0 is a valid value
-    if loss != 'bcedice' or extra_term != 'none' or boundary_weight is not None:
+    aff_weight = getattr(args, 'aff_weight', None)   # EXP-13 edge-affinity loss
+    if loss != 'bcedice' or extra_term != 'none' or boundary_weight is not None or aff_weight is not None:
         from contour_losses import build_criterion
         config.loss_config = dict(loss=loss, extra_term=extra_term,
                                   extra_weight=getattr(args, 'extra_weight', None),
                                   snbl_tau=getattr(args, 'snbl_tau', 3.0),
                                   area_delta=getattr(args, 'area_delta', 0.05))
+        if 'hp' in [t.strip() for t in extra_term.split(',')]:   # EXP-11, only then (older configs unchanged)
+            config.loss_config['hp_radius'] = getattr(args, 'hp_radius', 10.0)
+            config.loss_config['hp_gamma'] = getattr(args, 'hp_gamma', 2.0)
         if boundary_weight is not None:   # only then, so the EXP-6/7/8 configs stay exactly as before
             config.loss_config['boundary_weight'] = boundary_weight
             if refine == 'gate':   # EXP-10: the loss supervises the dec5 head with the contour zone
                 config.loss_config['boundary_stages'] = {'dec5': 1.0}
                 config.loss_config['boundary_radius'] = getattr(args, 'refine_radius', 10)
+            elif complete not in (None, 'none'):   # EXP-11: the ring loss supervises the barrier head
+                config.loss_config['boundary_stages'] = {'ring': 1.0}
+                config.loss_config['ring_radius'] = getattr(args, 'ring_radius', 3)
+        if aff_weight is not None:   # EXP-13, only then (older configs unchanged)
+            config.loss_config['aff_weight'] = aff_weight
+            config.loss_config['comp_weight'] = getattr(args, 'comp_weight', 0.0)
+            config.loss_config['hard_frac'] = getattr(args, 'hard_frac', 0.2)
         config.criterion = build_criterion(**config.loss_config)
         config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
     config.save_every = getattr(args, 'save_every', None)

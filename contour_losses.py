@@ -49,6 +49,26 @@ EXP-9 boundary-band auxiliary loss (--boundary-weight, only with the boundary-gu
        is at least one cell wide there. Loss = 0.1 * BD(dec3) + 0.2 * BD(dec4) + 0.3 * BD(dec5),
        BD = BceDice(wb=0.5, wd=1) on sigmoid(logit) at the head's grid (weights from LB-UNet,
        not calibrated here). With weight 0 the terms are only logged, under no_grad.
+
+EXP-11 (models/completion.py, --complete):
+  ring  the barrier head of the region completion is trained on the +-r px ring of the contour
+        (boundary_ring: dilate - erode with a (2r+1) square max-pool, r = 3 by default), max-pooled to
+        the head's 128 grid; same BceDice(wb=0.5, wd=1), weight --boundary-weight, column bnd_ring.
+  hp    hard-positive term on the final output (--extra-term hp): mean over all B*H*W pixels of
+        1[d_in > r] * (1 - u)^gamma * BCE(u, 1), d_in = distance of a lesion pixel to the background
+        (r = 10 px, gamma = 2). Normalized like utils.BCELoss, so its weight multiplies BCE directly on
+        the deep lesion pixels; F.binary_cross_entropy clamps the log at -100 as the original loss does.
+
+EXP-13 (models/propagation.py, --propagate):
+  aff   the edge head of the core-to-region propagation, S = P(same label) on edges between neighbouring cells of
+        the 128 grid (GT average-pooled 2x2, >= 0.5). Edge groups: X = edges crossing the GT contour, LL = both
+        cells lesion, BB = both background, LL_hard = the hard_frac (20 %) LL edges of each image with the largest
+        colour + P1 contrast (the dark-core edge must not become a cut). Loss = 0.5 * mean_X[-log(1 - S)] +
+        0.25 * (mean_LL + mean_BB) / 2 * [-log S] + 0.25 * mean_LLhard[-log S], each mean over the batch's edges
+        of that group. Logged per term (aff_X, aff_LL, aff_BB, aff_hard) plus rank_acc, the share of images whose
+        mean S on LL_hard exceeds the mean S on X (not part of the loss).
+  comp  (pair_coupled only) BCE of the propagated map R against the GT cells, over the GT dilated by 10 cells,
+        seed cells excluded.
 '''
 import functools
 import math
@@ -61,7 +81,7 @@ import torch.nn.functional as F
 from utils import BCELoss, BceDiceLoss, GT_BceDiceLoss
 
 LOSS_MODES = ['bcedice', 'bce_region']
-EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp']
+EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp', 'hp']
 TV_EPS = 1e-8
 BOUNDARY_STAGE_WEIGHTS = {'dec3': 0.1, 'dec4': 0.2, 'dec5': 0.3}
 
@@ -153,6 +173,70 @@ def boundary_zone(target, radius):
             mn = m.numpy()
             d = torch.from_numpy(np.where(mn, distance_transform_edt(mn), distance_transform_edt(~mn)))
         out[b, 0] = (d <= radius).float()
+    return out
+
+
+def boundary_ring(target, radius=3):
+    '''EXP-11 contour ring of the binarized target (B,1,H,W): dilate - erode with a (2r+1) x (2r+1) square,
+    i.e. 1 on the pixels within r px (Chebyshev) of the contour on either side. Same -inf padding as
+    boundary_band, so the image frame is never marked. radius=1 gives boundary_band.'''
+    r = int(radius)
+    if r < 1:
+        raise ValueError(f'ring radius must be >= 1, got {radius}')
+    m = (target.detach() > 0.5).float()
+    k = 2 * r + 1
+    return F.max_pool2d(m, k, 1, r) - (-F.max_pool2d(-m, k, 1, r))
+
+
+def deep_positive_mask(target, radius=10.0, backend=None):
+    '''EXP-11: 1 on lesion pixels (target >= 0.5) whose Euclidean distance to the nearest background pixel
+    exceeds `radius` px: the "far" FN band of analysis/exp09_mechanism.GroundTruth (fn_code == 2). A mask
+    with no background counts as all deep; an empty mask gives zeros. GPU tensors (or backend='torch')
+    use edt_torch, CPU tensors scipy.'''
+    g = target.detach() >= 0.5
+    out = torch.zeros(g.shape, dtype=torch.float32, device=g.device)
+    use_torch = backend == 'torch' or (backend is None and g.is_cuda)
+    if not use_torch:
+        from scipy.ndimage import distance_transform_edt
+    for b in range(g.shape[0]):
+        m = g[b, 0]
+        if not m.any():
+            continue
+        if m.all():
+            out[b, 0] = 1.0
+            continue
+        if use_torch:
+            d = edt_torch(~m)
+        else:
+            d = torch.from_numpy(distance_transform_edt(m.cpu().numpy())).to(g.device)
+        out[b, 0] = (m & (d > radius)).float()
+    return out
+
+
+def edge_masks(target, size, hard_contrast=None, hard_frac=0.2):
+    '''EXP-13 edge groups on the propagation grid. target (B,1,H,W) at full resolution -> cells at `size` by 2x2
+    average pooling (>= 0.5). Returns dict of (B,4,h,w) bool masks X / LL / BB (+ LL_hard when hard_contrast,
+    (B,4,h,w), is given) and the cell labels (B,1,h,w). Edges leaving the grid belong to no group.'''
+    from models.propagation import OFFS_HALF, shift
+    lab = F.adaptive_avg_pool2d((target.detach() >= 0.5).float(), size) >= 0.5
+    ones = torch.ones_like(lab, dtype=torch.float32)
+    X, LL, BB = [], [], []
+    for dy, dx in OFFS_HALF:
+        valid = shift(ones, dy, dx) > 0.5
+        ly = shift(lab.float(), dy, dx) > 0.5
+        X.append(valid & (lab != ly))
+        LL.append(valid & lab & ly)
+        BB.append(valid & ~lab & ~ly)
+    out = {'X': torch.cat(X, 1), 'LL': torch.cat(LL, 1), 'BB': torch.cat(BB, 1), 'lab': lab}
+    if hard_contrast is not None:
+        hard = torch.zeros_like(out['LL'])
+        for b in range(lab.shape[0]):
+            m = out['LL'][b]
+            if m.sum() >= 10:
+                v = hard_contrast[b][m]
+                thr = torch.quantile(v.float(), 1 - hard_frac) if v.numel() <= 16_000_000 else v.float().sort()[0][int((1 - hard_frac) * v.numel())]
+                hard[b] = m & (hard_contrast[b] >= thr)
+        out['LL_hard'] = hard
     return out
 
 
@@ -273,8 +357,61 @@ class FNDistance(nn.Module):
         return (g * (1 - u) * distance_to_prediction(u, target)).mean()
 
 
+class HardPositive(nn.Module):
+    '''EXP-11: mean over all pixels of 1[d_in > radius] * (1 - u)^gamma * BCE(u, 1) (focal BCE on the deep
+    lesion pixels; the (1 - u)^gamma factor is part of the loss, not detached). A pixel the model already
+    paints (u -> 1) costs nothing; a confidently missed one (u -> 0) gets the full BCE push.'''
+    def __init__(self, radius=10.0, gamma=2.0):
+        super().__init__()
+        if gamma != 0 and gamma < 1:
+            raise ValueError(f'hp gamma must be 0 or >= 1, got {gamma}')
+        self.radius, self.gamma = float(radius), float(gamma)
+
+    def forward(self, u, target):
+        h = deep_positive_mask(target, self.radius)
+        bce = F.binary_cross_entropy(u, torch.ones_like(u), reduction='none')
+        w = (1 - u) ** self.gamma if self.gamma else 1.0
+        return (h * w * bce).mean()
+
+
+def affinity_terms(s_logit, masks):
+    '''Unweighted mean BCE of the edge logits per group (0 for an empty group) and the combined affinity loss.'''
+    def mean_over(t, m):
+        n = m.sum()
+        return (t * m).sum() / n if n > 0 else t.sum() * 0
+    cut = F.softplus(s_logit)          # -log(1 - S)
+    keep = F.softplus(-s_logit)        # -log S
+    t = {'aff_X': mean_over(cut, masks['X']), 'aff_LL': mean_over(keep, masks['LL']),
+         'aff_BB': mean_over(keep, masks['BB']), 'aff_hard': mean_over(keep, masks['LL_hard'])}
+    loss = 0.5 * t['aff_X'] + 0.25 * 0.5 * (t['aff_LL'] + t['aff_BB']) + 0.25 * t['aff_hard']
+    return loss, t
+
+
+def ranking_accuracy(s_logit, masks):
+    '''Share of images (with both groups) whose mean S on LL_hard exceeds the mean S on X.'''
+    with torch.no_grad():
+        s = torch.sigmoid(s_logit)
+        wins, n = 0, 0
+        for b in range(s.shape[0]):
+            h, x = masks['LL_hard'][b], masks['X'][b]
+            if h.any() and x.any():
+                wins += int(s[b][h].mean() > s[b][x].mean())
+                n += 1
+        return wins / n if n else float('nan')
+
+
+def completion_term(r, lab, seed, dilate_cells=10):
+    '''BCE(R, GT cell labels) over the GT dilated by dilate_cells, seed cells excluded (EXP-13 pair_coupled).'''
+    k = 2 * dilate_cells + 1
+    region = (F.max_pool2d(lab.float(), k, 1, dilate_cells) > 0.5) & (seed < 0.5)
+    if not region.any():
+        return r.sum() * 0
+    bce = F.binary_cross_entropy(r.clamp(1e-6, 1 - 1e-6), lab.float(), reduction='none')
+    return (bce * region).sum() / region.sum()
+
+
 TERM_CLASSES = {'fn_dp': FNDistance, 'tv': TVLength, 'tv_match': TVMatch, 'area': LogArea,
-                'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss}
+                'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss, 'hp': HardPositive}
 
 
 # ----------------------------------------------------------------------------- criteria
@@ -348,7 +485,7 @@ class WithBoundaryAux(nn.Module):
     inner criterion's, so train.py logs them as train_extra_* columns. With weight 0 the band terms
     are computed under no_grad for the log only and the result is inner's value, unchanged.
     `target_fn(target)` builds the full-resolution target map; the default is the 2-px contour band
-    (EXP-9), EXP-10 passes a contour zone of a given radius.'''
+    (EXP-9), EXP-10 passes a contour zone of a given radius, EXP-11 a +-r px contour ring.'''
     def __init__(self, inner, weight, stage_weights=None, target_fn=None):
         super().__init__()
         self.inner = inner
@@ -399,6 +536,58 @@ class WithBoundaryAux(nn.Module):
         return total
 
 
+class WithPropagationAux(nn.Module):
+    '''EXP-13: inner(gt_pre, out, target) + w_aff * affinity loss + w_comp * completion loss. The edge logits, the
+    propagated map, the seed and the edge contrast come from models.propagation.CorePropagation through
+    gt_pre.boundary ('aff', 'prop', 'seed', 'contrast'). Keeps running means of every unweighted term and of
+    rank_acc for the train_extra_* log columns.'''
+    def __init__(self, inner, w_aff, w_comp=0.0, hard_frac=0.2):
+        super().__init__()
+        self.inner = inner
+        self.w_aff, self.w_comp, self.hard_frac = float(w_aff), float(w_comp), float(hard_frac)
+        self.own = ['aff_X', 'aff_LL', 'aff_BB', 'aff_hard', 'rank_acc'] + (['comp'] if self.w_comp > 0 else [])
+        self.names = list(getattr(inner, 'names', [])) + self.own
+        self.reset_stats()
+
+    def reset_stats(self):
+        if hasattr(self.inner, 'reset_stats'):
+            self.inner.reset_stats()
+        self._sums, self._counts = {n: 0.0 for n in self.own}, {n: 0 for n in self.own}
+
+    def epoch_means(self):
+        out = dict(self.inner.epoch_means()) if hasattr(self.inner, 'epoch_means') else {}
+        out.update({n: (self._sums[n] / self._counts[n] if self._counts[n] else float('nan')) for n in self.own})
+        return out
+
+    def epoch_mean(self):
+        return self.epoch_means()[self.names[0]]
+
+    def _log(self, name, v):
+        if v == v:   # skip nan
+            self._sums[name] += float(v)
+            self._counts[name] += 1
+
+    def forward(self, gt_pre, out, target):
+        bnd = getattr(gt_pre, 'boundary', None)
+        need = ('aff', 'prop', 'seed', 'contrast')
+        if bnd is None or not all(k in bnd for k in need):
+            raise ValueError(f'the propagation loss needs {need} from the propagation module in gt_pre.boundary; '
+                             f'got {None if bnd is None else sorted(bnd)}')
+        total = self.inner(gt_pre, out, target)
+        s_logit = bnd['aff']
+        masks = edge_masks(target, s_logit.shape[-2:], bnd['contrast'], self.hard_frac)
+        aff, terms = affinity_terms(s_logit, masks)
+        for k, v in terms.items():
+            self._log(k, float(v.detach()))
+        self._log('rank_acc', ranking_accuracy(s_logit, masks))
+        total = total + self.w_aff * aff
+        if self.w_comp > 0:
+            comp = completion_term(bnd['prop'], masks['lab'], bnd['seed'])
+            self._log('comp', float(comp.detach()))
+            total = total + self.w_comp * comp
+        return total
+
+
 def parse_terms(extra_term='none', extra_weight=None):
     '''"bl,fn_dp" and "0.095,0.35" (or a float) -> [('bl', 0.095), ('fn_dp', 0.35)]; [] for none.'''
     names = [t.strip() for t in str(extra_term).split(',') if t.strip()]
@@ -419,7 +608,8 @@ def parse_terms(extra_term='none', extra_weight=None):
 
 
 def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weight=None,
-             boundary_stages=None, boundary_radius=None, **kw):
+             boundary_stages=None, boundary_radius=None, ring_radius=None, aff_weight=None, comp_weight=0.0,
+             hard_frac=0.2, **kw):
     terms = parse_terms(extra_term, extra_weight)
     s = loss + ''.join(f' + {w:g} * {n}' for n, w in terms)
     names = [n for n, _ in terms]
@@ -427,43 +617,68 @@ def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weig
         s += f' (tau {kw.get("snbl_tau", 3.0)})'
     if 'area' in names:
         s += f' (delta {kw.get("area_delta", 0.05)})'
+    if 'hp' in names:
+        s += f' (hp r={float(kw.get("hp_radius", 10.0)):g}px, gamma {float(kw.get("hp_gamma", 2.0)):g})'
     if boundary_weight is not None:
         bw = float(boundary_weight)
-        if boundary_radius is not None:   # EXP-10 contour zone on the dec5 head (ASCII: the log line is compared as text)
+        if ring_radius is not None:   # EXP-11 barrier head of the region completion (ASCII, see below)
+            s += (f' + {bw:g} * ring (BceDice(0.5,1) on the +-{int(ring_radius)}px contour ring, barrier head)'
+                  if bw != 0 else f' (+ ring +-{int(ring_radius)}px loss logged only, weight 0)')
+        elif boundary_radius is not None:   # EXP-10 contour zone on the dec5 head (ASCII: the log line is compared as text)
             where = '/'.join(f'{w:g}*{st}' for st, w in (boundary_stages or {'dec5': 1.0}).items())
             s += (f' + {bw:g} * zone (BceDice(0.5,1) on the r={int(boundary_radius)}px contour zone, {where})'
                   if bw != 0 else f' (+ zone r={int(boundary_radius)}px loss logged only, weight 0)')
         else:
             s += (f' + {bw:g} * bnd (0.1*dec3 + 0.2*dec4 + 0.3*dec5, BceDice(0.5,1) on the contour band per head grid)'
                   if bw != 0 else ' (+ bnd contour-band loss logged only, weight 0)')
+    if aff_weight is not None:   # EXP-13 edge affinity of the propagation (ASCII: the log line is compared as text)
+        s += (f' + {float(aff_weight):g} * aff (edge BCE same-label: 0.5 cut / 0.25 LL+BB / 0.25 hard'
+              f' {int(round(100 * float(hard_frac)))}% contrast)')
+        if float(comp_weight) > 0:
+            s += f' + {float(comp_weight):g} * comp (BCE of propagated R vs GT, GT dilated 10 cells)'
     return s
 
 
-def make_term(name, snbl_tau=3.0, area_delta=0.05):
+def make_term(name, snbl_tau=3.0, area_delta=0.05, hp_radius=10.0, hp_gamma=2.0):
     if name == 'snbl':
         return ScaleNormBoundaryLoss(tau=snbl_tau)
     if name == 'area':
         return LogArea(delta=area_delta)
+    if name == 'hp':
+        return HardPositive(radius=hp_radius, gamma=hp_gamma)
     return TERM_CLASSES[name]()
 
 
 def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05,
-                    boundary_weight=None, boundary_stages=None, boundary_radius=None):
+                    boundary_weight=None, boundary_stages=None, boundary_radius=None, ring_radius=None,
+                    hp_radius=10.0, hp_gamma=2.0, aff_weight=None, comp_weight=0.0, hard_frac=0.2):
     '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1); extra terms
     alone return EXP-6/7's WithExtraTerm; a boundary_weight (EXP-9, 0 allowed) wraps either in
     WithBoundaryAux. boundary_stages / boundary_radius (EXP-10) supervise the given heads with the
-    contour zone of that radius instead of the 2-px band on dec3/4/5.'''
+    contour zone of that radius instead of the 2-px band on dec3/4/5; ring_radius (EXP-11) with the
+    +-r px contour ring.'''
     if loss not in LOSS_MODES:
         raise ValueError(f'unknown loss {loss!r}; choose from {LOSS_MODES}')
     terms = parse_terms(extra_term, extra_weight)
     base = GT_BceDiceLoss(wb=1, wd=1) if loss == 'bcedice' else GT_BceRegionLoss(wb=1, wr=1)
-    crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta), w) for n, w in terms])
+    crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta, hp_radius, hp_gamma), w)
+                                                        for n, w in terms])
+    if aff_weight is not None:   # EXP-13
+        if boundary_weight is not None:
+            raise ValueError('the propagation affinity loss does not combine with a boundary loss')
+        if float(aff_weight) < 0 or float(comp_weight) < 0 or not 0 < float(hard_frac) < 1:
+            raise ValueError(f'aff_weight / comp_weight must be >= 0 and hard_frac in (0, 1); got {aff_weight}, {comp_weight}, {hard_frac}')
+        return WithPropagationAux(crit, aff_weight, comp_weight, hard_frac)
     if boundary_weight is None:
         return crit
     if float(boundary_weight) < 0:
         raise ValueError(f'boundary_weight must be >= 0, got {boundary_weight}')
     target_fn = None
-    if boundary_radius is not None:
+    if ring_radius is not None:
+        if boundary_radius is not None:
+            raise ValueError('give either boundary_radius (EXP-10 zone) or ring_radius (EXP-11 ring), not both')
+        target_fn = functools.partial(boundary_ring, radius=int(ring_radius))
+    elif boundary_radius is not None:
         if float(boundary_radius) <= 0:
             raise ValueError(f'boundary_radius must be > 0, got {boundary_radius}')
         target_fn = functools.partial(boundary_zone, radius=float(boundary_radius))

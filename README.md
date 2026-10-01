@@ -205,6 +205,47 @@ with `analysis/exp10_mechanism.py` (same-checkpoint knockouts of the residual an
 quality, leverage, errors by distance to the contour). Checks: `python tests/test_refine.py`. Every EXP-4..9
 configuration is bit-identical to the EXP-9 code.
 
+**5g. EXP-11: boundary-constrained region completion (branch `exp/11-bcrc`).**
+
+Target: on large lesions the model paints the dark core and misses a pale ring 10-50 px wide inside the true
+contour. `--complete {full,nobarrier}` (with `--fusion sum --fusion-stages shallow3`) grows the model's own
+confident region at dec5 and adds only the grown part to the logit: seed = cells with base probability >=
+`--complete-seed` (0.9); an evidence map A (1x1 conv + GroupNorm + GELU + 3x3 conv on the dec5 feature, the five
+fusion projections and the image-wide mean of the dec5 feature) and a barrier map B (3x3 conv on the dec5
+feature and the shallowest projection, gradient-detached) set how far it spreads: `--complete-steps` (32) times
+R = max(R, maxpool3x3(R) * A * (1 - B)) (`nobarrier` drops the (1 - B) factor), then z = z_base + softplus(rho) *
+(R - seed). It starts with A = 0.95, B = 0.05 and softplus(rho) = 0.018. `--boundary-weight W --ring-radius r`
+supervises B with the +-r px contour ring (column `train_extra_bnd_ring`). `--extra-term hp --extra-weight L`
+adds a focal BCE on lesion pixels more than `--hp-radius` (10) px inside the contour (`--hp-gamma` 2), weight
+from `analysis/calibrate_loss_weights.py --hp-balance`. Mode, step count and seed threshold are stored as
+buffers, so a checkpoint refuses to load into a model built with other values. Implementation in
+[models/completion.py](models/completion.py); runs [scripts/exp11_train.sh](scripts/exp11_train.sh), per-box
+runner [scripts/exp11_box.sh](scripts/exp11_box.sh), evaluation [scripts/exp11_analyze.sh](scripts/exp11_analyze.sh)
+with `analysis/exp11_errors.py` (errors by position on val and train, the heavy-image set in
+`analysis/lists/`, threshold-curve comparison, run-to-run noise) and `analysis/exp11_mechanism.py` (knockouts,
+evidence AUC, barrier on the true and the inner contour, polygon split); step 0 also uses
+`analysis/exp11_reach.py`. Checks: `python tests/test_completion.py`. Every EXP-4..10 configuration is
+bit-identical to the EXP-10 code.
+
+**5h. EXP-13: boundary-constrained core-to-region propagation (branch `exp/13-crp`).**
+
+EXP-11 grew the confident core over unary maps that had no supervision of their own. `--propagate
+{pair,pair_coupled,pair_nocap}` (with `--fusion sum --fusion-stages shallow3`) grows it along EDGES of the 128 grid:
+an edge head reads detached per-cell features (dec5 feature, the five fusion projections, z_base, colour, and the
+image-relative coordinates t_z / t_rgb, which place a cell between the image's background and core level) and
+predicts S = P(same label) for each pair of neighbours (affinity and barrier in one; the barrier is 1 - S). The core
+(p >= `--propagate-seed`) spreads for `--propagate-steps` max-product steps over S^beta times a relative cap
+sigmoid(kappa (t_z - tau)) (`pair_nocap` drops the cap), and the grown part joins the output by probabilistic OR at
+256. `--aff-weight` trains S with an edge BCE on GT edge labels (cut edges, lesion-lesion, background-background,
+and the `--hard-frac` highest-contrast lesion-lesion edges as "do not cut"); in `pair` / `pair_nocap` this is the
+only signal the edge head gets, `pair_coupled` adds the segmentation loss and `--comp-weight` x a completion BCE
+through the propagation. tau, kappa, beta come from `analysis/exp13_step0.py` (train images only). Implementation in
+[models/propagation.py](models/propagation.py); runs [scripts/exp13_train.sh](scripts/exp13_train.sh), per-box runner
+[scripts/exp13_box.sh](scripts/exp13_box.sh), evaluation [scripts/exp13_analyze.sh](scripts/exp13_analyze.sh) with
+`analysis/exp13_mechanism.py` (edge statistics on the dark-core edge vs the GT contour, growth precision and leakage,
+knockouts). Checks: `python tests/test_propagation.py`. Every EXP-4..11 configuration is bit-identical to the
+EXP-11 code.
+
 **6. Repository layout and experiment workflow.**
 
 ```
