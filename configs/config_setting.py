@@ -242,7 +242,12 @@ def get_config(args=None):
     extra_term = getattr(args, 'extra_term', None) or 'none'
     boundary_weight = getattr(args, 'boundary_weight', None)   # EXP-9 contour-band loss; 0 is a valid value
     aff_weight = getattr(args, 'aff_weight', None)   # EXP-13 edge-affinity loss
-    if loss != 'bcedice' or extra_term != 'none' or boundary_weight is not None or aff_weight is not None:
+    lsa = getattr(args, 'lsa', None)   # EXP-15 selective fusion; keys only when used
+    lsa_on = lsa not in (None, 'none')
+    if lsa_on:
+        config.model_config['lsa_mode'] = lsa
+        config.model_config['lsa_aux'] = getattr(args, 'lsa_aux', 'probe')
+    if loss != 'bcedice' or extra_term != 'none' or boundary_weight is not None or aff_weight is not None or lsa_on:
         from contour_losses import build_criterion
         config.loss_config = dict(loss=loss, extra_term=extra_term,
                                   extra_weight=getattr(args, 'extra_weight', None),
@@ -266,6 +271,9 @@ def get_config(args=None):
             elif complete not in (None, 'none'):   # EXP-11: the ring loss supervises the barrier head
                 config.loss_config['boundary_stages'] = {'ring': 1.0}
                 config.loss_config['ring_radius'] = getattr(args, 'ring_radius', 3)
+        if lsa_on:   # EXP-15 expert aux losses
+            config.loss_config['lsa_aux'] = getattr(args, 'lsa_aux', 'probe')
+            config.loss_config['lsa_tau'] = getattr(args, 'lsa_tau', 0.15)
         if aff_weight is not None:   # EXP-13, only then (older configs unchanged)
             config.loss_config['aff_weight'] = aff_weight
             config.loss_config['comp_weight'] = getattr(args, 'comp_weight', 0.0)

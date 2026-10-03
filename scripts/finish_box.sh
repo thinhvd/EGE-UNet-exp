@@ -35,7 +35,7 @@ for attempt in 1 2 3; do
     mkdir -p "$LOCAL_DIR/box_logs_$DS"
     rsync -az -e "ssh -p $PORT -o ConnectTimeout=20" "$HOST:$DONE_LOG" "$LOCAL_DIR/box_logs_$DS/" 2>>"$TMP/sync.log"
     timeout 300 "${SSH[@]}" "cd /workspace/EGE-UNet/results && find egeunet_${DS}_* ${PREFIX}_${DS} ${PREFIX}_analyze_${DS}.log \
-        ${PREFIX}_summary_${DS}.md -type f ! -name latest.pth ! -path '*/summary/*' ! -path '*/outputs/*' 2>/dev/null \
+        ${PREFIX}_summary_*${DS}* -type f ! -name latest.pth ! -path '*/summary/*' ! -path '*/outputs/*' 2>/dev/null \
         | LC_ALL=C sort | xargs md5sum" > "$TMP/box.md5" 2>/dev/null
     (cd "$LOCAL_DIR" && cut -c35- "$TMP/box.md5" | xargs md5sum 2>/dev/null) > "$TMP/local.md5"
     nbox=$(wc -l < "$TMP/box.md5")

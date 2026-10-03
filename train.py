@@ -169,6 +169,16 @@ def parse_args():
                         help='EXP-13: weight of the completion loss on the propagated map (pair_coupled only)')
     parser.add_argument('--hard-frac', type=float, default=0.2,
                         help='EXP-13: share of each image\'s lesion-lesion edges, by contrast, treated as hard "do not cut" edges')
+    parser.add_argument('--lsa', type=str, default=None, choices=['none', 'fixed', 'route'],
+                        help='EXP-15 lesion-state-aware selective fusion (needs --fusion sum --fusion-stages shallow3): '
+                             'the fusion projections feed a detail expert (stages 1-3) and a completion expert (3-5); '
+                             'route = a per-stage router {detail, completion, null} reading the decoder feature and the '
+                             "stage's own lesion estimate; fixed = 0.5 / 0.5 / 0 everywhere")
+    parser.add_argument('--lsa-aux', type=str, default='probe', choices=['probe', 'supervise'],
+                        help='EXP-15: probe = the experts\' aux heads read detached features (readout only); supervise = '
+                             'their losses train the experts and projections (never the encoder)')
+    parser.add_argument('--lsa-tau', type=float, default=0.15,
+                        help='EXP-15: normalized depth from which a lesion pixel is interior (completion aux loss)')
     parser.add_argument('--test-split', type=str, default=None,
                         help='EXP-14 protocol (70:10:20): after training, test the best checkpoint on this split folder of '
                              '--data-path (e.g. "test") instead of the val split; val keeps selecting the checkpoint. '
@@ -233,6 +243,15 @@ def parse_args():
             parser.error('--hard-frac must be in (0, 1)')
     elif args.aff_weight is not None or args.comp_weight:
         parser.error('--aff-weight / --comp-weight only go with --propagate')
+    # EXP-15: the selective fusion replaces the combine step of the sum fusion on dec3..dec5
+    lsa = args.lsa if args.lsa and args.lsa != 'none' else None
+    if lsa is not None:
+        if args.fusion != 'sum' or args.fusion_stages != 'shallow3':
+            parser.error('--lsa needs --fusion sum --fusion-stages shallow3')
+        if refine is not None or complete is not None or propagate is not None:
+            parser.error('--lsa does not combine with --refine / --complete / --propagate')
+        if args.boundary_weight is not None or (args.extra_term and args.extra_term != 'none'):
+            parser.error('--lsa brings its own aux losses; drop --boundary-weight / --extra-term')
     if args.boundary_weight is not None and args.fusion != 'bg_stage' and refine != 'gate' and complete is None:
         parser.error('--boundary-weight only goes with --fusion bg_stage, --refine gate or --complete')
     if args.boundary_weight is not None and args.boundary_weight < 0:
@@ -317,6 +336,8 @@ def main(config):
                         propagate_tau=model_cfg.get('propagate_tau', 0.3),
                         propagate_kappa=model_cfg.get('propagate_kappa', 10.0),
                         propagate_beta=model_cfg.get('propagate_beta', 1.0),
+                        lsa_mode=model_cfg.get('lsa_mode', 'none'),
+                        lsa_aux=model_cfg.get('lsa_aux', 'probe'),
                         )
     else: raise Exception('network in not right!')
     model = model.to(config.device)
@@ -331,6 +352,7 @@ def main(config):
                 + (f'propagate: {model.propagate_mode} T={model.propagate.steps} seed={model.propagate.seed_thr:g} '
                    f'tau={model.propagate.tau:g} kappa={model.propagate.kappa:g} beta={model.propagate.beta:g}, '
                    if model.propagate_mode != 'none' else '')
+                + (f'lsa: {model.lsa_mode} aux={model.lsa.aux_mode}, ' if model.lsa_mode != 'none' else '')
                 + f'params: {n_total} total / {n_trainable} trainable')
     print(log_info)
     logger.info(log_info)

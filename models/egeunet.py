@@ -9,6 +9,7 @@ from models.fusion import CrossStageFusion, DeepSupervisionOutputs, FUSION_MODES
 from models.refine import Dec5BoundaryResidual, REFINE_MODES
 from models.completion import RegionCompletion, COMPLETE_MODES
 from models.propagation import CorePropagation, PROPAGATE_MODES
+from models.lsa_fusion import LesionStateFusion, LSA_MODES, LSA_AUX, LSA_STAGES
 
 
 class DepthWiseConv2d(nn.Module):
@@ -198,7 +199,7 @@ class EGEUNet(nn.Module):
                  fusion_mode='none', fusion_stages=None, fusion_dim=16, refine_mode='none',
                  complete_mode='none', complete_steps=32, complete_seed=0.9,
                  propagate_mode='none', propagate_steps=32, propagate_seed=0.9, propagate_tau=0.3,
-                 propagate_kappa=10.0, propagate_beta=1.0):
+                 propagate_kappa=10.0, propagate_beta=1.0, lsa_mode='none', lsa_aux='probe'):
         super().__init__()
 
         self.bridge = bridge
@@ -289,6 +290,9 @@ class EGEUNet(nn.Module):
         if propagate_mode not in PROPAGATE_MODES:
             raise ValueError(f'propagate_mode must be one of {PROPAGATE_MODES}, got {propagate_mode!r}')
         self.propagate_mode = propagate_mode
+        if lsa_mode not in LSA_MODES or lsa_aux not in LSA_AUX:
+            raise ValueError(f'lsa_mode must be one of {LSA_MODES} and lsa_aux one of {LSA_AUX}, got {lsa_mode!r}, {lsa_aux!r}')
+        self.lsa_mode = lsa_mode
 
         self.apply(self._init_weights)
 
@@ -361,6 +365,25 @@ class EGEUNet(nn.Module):
             print(f'dec5 core-to-region propagation = {propagate_mode} (steps {propagate_steps}, seed p >= {propagate_seed}, '
                   f'cap tau {propagate_tau} kappa {propagate_kappa}, beta {propagate_beta})')
 
+        # EXP-15 lesion-state-aware selective fusion (models/lsa_fusion.py). The plain fusion above is built unchanged
+        # (same RNG draws, same projections P1..P5), then its combine step (sum_w, heads) is removed and replaced by two
+        # experts + a router per stage, built inside fork_rng: the global RNG, hence data order and augmentation,
+        # continues as in the fusion-only model. Heads start at zero, so the output starts as the original model's.
+        if lsa_mode != 'none':
+            if fusion_mode != 'sum' or list(self.fusion_stages) != list(LSA_STAGES):
+                raise ValueError('lsa needs --fusion sum --fusion-stages shallow3')
+            if refine_mode != 'none' or complete_mode != 'none' or propagate_mode != 'none':
+                raise ValueError('lsa replaces the fusion combine step; it does not combine with refine / complete / propagate')
+            if not gt_ds:
+                raise ValueError('lsa routes with the deep-supervision estimates of each stage, so it needs gt_ds=True')
+            del self.fusion.heads
+            del self.fusion.sum_w
+            with torch.random.fork_rng(devices=[]):
+                self.lsa = LesionStateFusion(c_list, fusion_dim, lsa_mode, lsa_aux)
+                self.lsa.apply(self._init_weights)
+            self.lsa.set_init()
+            print(f'lesion-state-aware selective fusion = {lsa_mode} (aux {lsa_aux}) on {list(LSA_STAGES)}')
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -402,11 +425,21 @@ class EGEUNet(nn.Module):
         # EXP-9 (boundary-guided): only the projections are computed here; each target stage then
         # reads its boundary map from its decoder feature after the GAB add, fuses and adds.
         fuse, p, bnd, proj, prob = {}, None, {}, None, None
+        fd = fc = None   # EXP-15 experts
+        gates = {}
         if self.fusion_mode != 'none':
             if self.boundary_guided:
                 p = self.fusion.project((t1, t2, t3, t4, t5))
             elif self.refine_mode != 'none' or self.complete_mode != 'none' or self.propagate_mode != 'none':   # EXP-10/11/13: plus projections
                 fuse, proj = self.fusion((t1, t2, t3, t4, t5), return_proj=True)
+            elif self.lsa_mode != 'none':   # EXP-15: the projections feed two experts, routed per stage below
+                feats = (t1, t2, t3, t4, t5)
+                fd, fc = self.lsa.experts(self.fusion.project(feats))
+                if self.lsa.aux_mode == 'supervise':   # aux losses train experts + projections, never the encoder
+                    ad, ac = self.lsa.aux_logits(*self.lsa.experts(self.fusion.project(tuple(t.detach() for t in feats))))
+                else:                                   # probe: aux heads read the experts without affecting them
+                    ad, ac = self.lsa.aux_logits(fd.detach(), fc.detach())
+                bnd.update({'lsa_d': ad, 'lsa_c': ac})
             else:
                 fuse = self.fusion((t1, t2, t3, t4, t5))
 
@@ -437,6 +470,7 @@ class EGEUNet(nn.Module):
         out3 = F.gelu(F.interpolate(self.dbn3(self.decoder3(out4)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c2, H/8, W/8
         if self.gt_ds: 
             gt_pre3 = self.gt_conv3(out3)
+            ds_dec3 = gt_pre3   # EXP-15: the stage's own deep-supervision logit, before upsampling
             t3 = self.GAB3(t4, t3, gt_pre3)
             gt_pre3 = F.interpolate(gt_pre3, scale_factor=8, mode ='bilinear', align_corners=True)
         else: t3 = self.GAB3(t4, t3)
@@ -445,10 +479,14 @@ class EGEUNet(nn.Module):
         elif p is not None and 'dec3' in self.fusion_stages:
             f, bnd['dec3'] = self.fusion.guided_stage('dec3', p, out3)
             out3 = out3 + f
+        elif fd is not None:
+            f, gates['dec3'] = self.lsa.stage('dec3', fd, fc, out3, torch.sigmoid(ds_dec3).detach())
+            out3 = out3 + f
         
         out2 = F.gelu(F.interpolate(self.dbn4(self.decoder4(out3)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c1, H/4, W/4
         if self.gt_ds: 
             gt_pre2 = self.gt_conv4(out2)
+            ds_dec4 = gt_pre2   # EXP-15: the stage's own deep-supervision logit, before upsampling
             t2 = self.GAB2(t3, t2, gt_pre2)
             gt_pre2 = F.interpolate(gt_pre2, scale_factor=4, mode ='bilinear', align_corners=True)
         else: t2 = self.GAB2(t3, t2)
@@ -457,10 +495,14 @@ class EGEUNet(nn.Module):
         elif p is not None and 'dec4' in self.fusion_stages:
             f, bnd['dec4'] = self.fusion.guided_stage('dec4', p, out2)
             out2 = out2 + f
+        elif fd is not None:
+            f, gates['dec4'] = self.lsa.stage('dec4', fd, fc, out2, torch.sigmoid(ds_dec4).detach())
+            out2 = out2 + f
         
         out1 = F.gelu(F.interpolate(self.dbn5(self.decoder5(out2)),scale_factor=(2,2),mode ='bilinear',align_corners=True)) # b, c0, H/2, W/2
         if self.gt_ds: 
             gt_pre1 = self.gt_conv5(out1)
+            ds_dec5 = gt_pre1   # EXP-15: the stage's own deep-supervision logit, before upsampling
             t1 = self.GAB1(t2, t1, gt_pre1)
             gt_pre1 = F.interpolate(gt_pre1, scale_factor=2, mode ='bilinear', align_corners=True)
         else: t1 = self.GAB1(t2, t1)
@@ -469,7 +511,12 @@ class EGEUNet(nn.Module):
         elif p is not None and 'dec5' in self.fusion_stages:
             f, bnd['dec5'] = self.fusion.guided_stage('dec5', p, out1)
             out1 = out1 + f
+        elif fd is not None:
+            f, gates['dec5'] = self.lsa.stage('dec5', fd, fc, out1, torch.sigmoid(ds_dec5).detach())
+            out1 = out1 + f
         
+        if gates:
+            bnd['lsa_g'] = gates
         if self.refine_mode != 'none':
             # EXP-10: residual correction on the logit at dec5's grid, before the final upsampling
             z = self.final(out1)

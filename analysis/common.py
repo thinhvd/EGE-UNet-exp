@@ -123,7 +123,20 @@ def infer_model_config(sd):
                         else 'plain' if any(k.startswith('refine.') for k in sd) else 'none'),
         **_infer_complete_config(sd),
         **_infer_propagate_config(sd),
+        **_infer_lsa_config(sd),
     }
+
+
+def _infer_lsa_config(sd):
+    '''EXP-15 selective fusion (models/lsa_fusion.py): router and aux modes from the provenance buffers.'''
+    if not any(k.startswith('lsa.') for k in sd):
+        return {}
+    from models.lsa_fusion import _ROUTER_ID, _AUX_ID
+    for k in ('lsa.router_id', 'lsa.aux_id'):
+        if k not in sd:
+            raise ValueError(f'selective-fusion checkpoint without its provenance buffer {k}')
+    return {'lsa_mode': {v: k for k, v in _ROUTER_ID.items()}[int(sd['lsa.router_id'])],
+            'lsa_aux': {v: k for k, v in _AUX_ID.items()}[int(sd['lsa.aux_id'])]}
 
 
 def _infer_propagate_config(sd):
@@ -160,6 +173,9 @@ def _infer_fusion_config(sd):
     '''EXP-4: recover the cross-stage fusion arguments (models/fusion.py) from the checkpoint keys.'''
     if not any(k.startswith('fusion.') for k in sd):
         return {'fusion_mode': 'none', 'fusion_stages': None, 'fusion_dim': 16}
+    if any(k.startswith('lsa.') for k in sd):   # EXP-15: the sum fusion's combine step was removed; stages are dec3..dec5
+        from models.lsa_fusion import LSA_STAGES
+        return {'fusion_mode': 'sum', 'fusion_stages': list(LSA_STAGES), 'fusion_dim': int(sd['fusion.proj.0.0.weight'].shape[0])}
     has_attn = any(k.startswith('fusion.attn.') for k in sd)
     has_sum = any(k.startswith('fusion.sum_w.') for k in sd)
     alpha = [k for k in sd if k.startswith('fusion.bg_alpha.')]

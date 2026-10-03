@@ -261,6 +261,25 @@ the background over the largest such distance in the image, is >= `--ihp-tau` an
 `python tests/test_exp14.py <mini root with train/val/test>`. Every earlier configuration is bit-identical to the
 EXP-13 code.
 
+**5j. EXP-15: lesion-state-aware selective cross-stage fusion (branch `exp/15-lsa-csf`).**
+
+`--lsa {fixed,route}` (with `--fusion sum --fusion-stages shallow3 --fusion-dim 8`) keeps the fusion's projections
+P1..P5 and replaces its combine step by two experts built once at their own grid, a detail expert from P1..P3 (grid
+128) and a completion expert from P3..P5 (grid 32), and, at dec3 / dec4 / dec5, a per-pixel softmax over {detail,
+completion, null}. In `route` mode a 1x1 conv chooses the gates from the decoder feature and four lesion-state channels
+(the stage's own detached deep-supervision probability, its local means over ~1/10 and ~1/3 of the grid, its image
+mean), biases (0, 0, -2); `fixed` uses (0.5, 0.5, 0). The heads start at zero, so a new model starts as the original
+one bit for bit. `--lsa-aux probe` trains the experts' aux heads (detail: segmentation + +-3 px contour ring;
+completion: segmentation + focal loss on lesion pixels with normalized depth >= `--lsa-tau`) on detached expert
+features; `supervise` lets these losses train the experts and projections, never the encoder. Implementation in
+[models/lsa_fusion.py](models/lsa_fusion.py), loss `contour_losses.WithExpertAux`. `analysis/swa_average.py` averages
+the checkpoints of epochs 200..300 (`--save-every 10 --save-from 200`). Runs:
+[scripts/exp15_train.sh](scripts/exp15_train.sh), [scripts/exp15_box.sh](scripts/exp15_box.sh),
+[scripts/exp15_analyze.sh](scripts/exp15_analyze.sh) with `analysis/exp15_mechanism.py` (LSA criterion and epoch-swing,
+gates by region, forced gates / knockouts, oracle routing, aux heads); step 0 in `analysis/exp15_step0.py`. Checks:
+`python tests/test_lsa.py <mini root with train/val/test>`. Every earlier configuration is bit-identical to the
+EXP-14 code.
+
 **6. Repository layout and experiment workflow.**
 
 ```

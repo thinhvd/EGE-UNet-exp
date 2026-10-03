@@ -70,6 +70,16 @@ EXP-14 (70:10:20 protocol; extra terms added to the original loss with a weight 
   tversky  Tversky loss (Salehi et al. 2017) per image, mean over the batch:
            1 - (TP + 1) / (TP + a FP + b FN + 1) with soft counts; b > a penalizes misses more than spill.
 
+EXP-15 (models/lsa_fusion.py, --lsa): auxiliary losses of the two fusion experts (WithExpertAux)
+  0.5 * [BceDice(detail seg) + BceDice(0.5,1)(detail ring, +-3 px contour ring)]
+  + 0.3 * [BceDice(completion seg) + ihr(completion seg)]
+  ihr = focal BCE (gamma 2) over the interior region H = {g = 1, normalized depth >= tau}, normalized by the number of
+  H pixels in the batch (not by all pixels, and not per image), so it neither vanishes in the total like EXP-11's hp
+  nor lets a small lesion's few interior pixels weigh as much as a large lesion's. Weights 0.5 / 0.3 = the
+  deep-supervision weights of the experts' grids (128 / 32), fixed before training. Aux logits are upsampled to the
+  input size as the deep-supervision maps are. In 'probe' mode the aux heads read detached experts (readout only).
+  Mean router gates g_C and g_null inside / outside the lesion are logged per stage (route mode).
+
 EXP-13 (models/propagation.py, --propagate):
   aff   the edge head of the core-to-region propagation, S = P(same label) on edges between neighbouring cells of
         the 128 grid (GT average-pooled 2x2, >= 0.5). Edge groups: X = edges crossing the GT contour, LL = both
@@ -496,6 +506,23 @@ class TverskyLoss(nn.Module):
         return (1 - (tp + 1) / (tp + self.alpha * fp + self.beta * fn + 1)).mean()
 
 
+class InteriorHardPositiveRegion(nn.Module):
+    '''EXP-15: focal BCE on the interior region H = {target = 1, normalized depth >= tau}, summed over H and divided by
+    the number of H pixels in the batch; 0 when the batch has no H pixel.'''
+    def __init__(self, tau=0.15, gamma=2.0):
+        super().__init__()
+        self.tau, self.gamma = float(tau), float(gamma)
+
+    def forward(self, u, target):
+        h = ((normalized_depth(target) >= self.tau) & (target >= 0.5)).float()
+        n = h.sum()
+        if n == 0:
+            return u.sum() * 0
+        bce = F.binary_cross_entropy(u, torch.ones_like(u), reduction='none')
+        w = (1 - u) ** self.gamma if self.gamma else 1.0
+        return (h * w * bce).sum() / n
+
+
 TERM_CLASSES = {'fn_dp': FNDistance, 'tv': TVLength, 'tv_match': TVMatch, 'area': LogArea,
                 'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss, 'hp': HardPositive,
                 'ihp': InteriorHardPositive, 'focal': FocalLoss, 'tversky': TverskyLoss}
@@ -675,6 +702,71 @@ class WithPropagationAux(nn.Module):
         return total
 
 
+class WithExpertAux(nn.Module):
+    '''EXP-15: inner(gt_pre, out, target) + 0.5 * detail aux + 0.3 * completion aux (see the module docstring). Reads
+    gt_pre.boundary['lsa_d'] (B,2,h,w), ['lsa_c'] (B,1,h,w) and, in route mode, ['lsa_g'] {stage: (B,3,G,G)}.'''
+    def __init__(self, inner, w_detail=0.5, w_completion=0.3, tau=0.15, ring_radius=3, gamma=2.0):
+        super().__init__()
+        self.inner = inner
+        self.w_d, self.w_c, self.ring_radius = float(w_detail), float(w_completion), int(ring_radius)
+        self.bd = BceDiceLoss(wb=1, wd=1)
+        self.bd_ring = BceDiceLoss(wb=0.5, wd=1)
+        self.ihr = InteriorHardPositiveRegion(tau, gamma)
+        self.terms = ['aux_d_seg', 'aux_d_ring', 'aux_c_seg', 'aux_c_ihr']
+        self.gate_names = [f'{g}_{r}_{s}' for s in ('dec3', 'dec4', 'dec5') for g in ('gC', 'gnull') for r in ('les', 'bg')]
+        self.names = list(getattr(inner, 'names', [])) + self.terms + self.gate_names
+        self.reset_stats()
+
+    def reset_stats(self):
+        if hasattr(self.inner, 'reset_stats'):
+            self.inner.reset_stats()
+        own = self.terms + self.gate_names
+        self._sums, self._counts = {n: 0.0 for n in own}, {n: 0 for n in own}
+
+    def epoch_means(self):
+        out = dict(self.inner.epoch_means()) if hasattr(self.inner, 'epoch_means') else {}
+        out.update({n: (self._sums[n] / self._counts[n] if self._counts[n] else float('nan')) for n in self._sums})
+        return out
+
+    def epoch_mean(self):
+        return self.epoch_means()[self.names[0]]
+
+    def _log(self, name, v):
+        if v == v:
+            self._sums[name] += float(v)
+            self._counts[name] += 1
+
+    def aux_terms(self, bnd, target):
+        size = target.shape[-2:]
+        up = lambda x: F.interpolate(x, size=size, mode='bilinear', align_corners=True)
+        d = torch.sigmoid(up(bnd['lsa_d']))
+        c = torch.sigmoid(up(bnd['lsa_c']))
+        ring = boundary_ring(target, self.ring_radius)
+        return {'aux_d_seg': self.bd(d[:, 0:1], target), 'aux_d_ring': self.bd_ring(d[:, 1:2], ring),
+                'aux_c_seg': self.bd(c, target), 'aux_c_ihr': self.ihr(c, target)}
+
+    def forward(self, gt_pre, out, target):
+        bnd = getattr(gt_pre, 'boundary', None)
+        if bnd is None or 'lsa_d' not in bnd or 'lsa_c' not in bnd:
+            raise ValueError('the expert aux loss needs lsa_d / lsa_c from models.lsa_fusion in gt_pre.boundary; got '
+                             f'{None if bnd is None else sorted(bnd)}')
+        total = self.inner(gt_pre, out, target)
+        t = self.aux_terms(bnd, target)
+        for k, v in t.items():
+            self._log(k, float(v.detach()))
+        total = total + self.w_d * (t['aux_d_seg'] + t['aux_d_ring']) + self.w_c * (t['aux_c_seg'] + t['aux_c_ihr'])
+        with torch.no_grad():
+            for s, g in (bnd.get('lsa_g') or {}).items():
+                les = F.adaptive_avg_pool2d((target >= 0.5).float(), g.shape[-2:]) >= 0.5
+                for gi, gname in ((1, 'gC'), (2, 'gnull')):
+                    gg = g[:, gi:gi + 1]
+                    if les.any():
+                        self._log(f'{gname}_les_{s}', float(gg[les].mean()))
+                    if (~les).any():
+                        self._log(f'{gname}_bg_{s}', float(gg[~les].mean()))
+        return total
+
+
 def parse_terms(extra_term='none', extra_weight=None):
     '''"bl,fn_dp" and "0.095,0.35" (or a float) -> [('bl', 0.095), ('fn_dp', 0.35)]; [] for none.'''
     names = [t.strip() for t in str(extra_term).split(',') if t.strip()]
@@ -696,7 +788,7 @@ def parse_terms(extra_term='none', extra_weight=None):
 
 def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weight=None,
              boundary_stages=None, boundary_radius=None, ring_radius=None, aff_weight=None, comp_weight=0.0,
-             hard_frac=0.2, **kw):
+             hard_frac=0.2, lsa_aux=None, lsa_tau=0.15, **kw):
     terms = parse_terms(extra_term, extra_weight)
     s = loss + ''.join(f' + {w:g} * {n}' for n, w in terms)
     names = [n for n, _ in terms]
@@ -725,6 +817,9 @@ def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weig
         else:
             s += (f' + {bw:g} * bnd (0.1*dec3 + 0.2*dec4 + 0.3*dec5, BceDice(0.5,1) on the contour band per head grid)'
                   if bw != 0 else ' (+ bnd contour-band loss logged only, weight 0)')
+    if lsa_aux is not None:   # EXP-15 expert aux losses (ASCII: the log line is compared as text)
+        s += (f' + expert aux {lsa_aux} (0.5*[BD(D seg)+BD(.5,1)(D ring +-3px)] + 0.3*[BD(C seg)+focal interior '
+              f'depth>={float(lsa_tau):g} /|H|])')
     if aff_weight is not None:   # EXP-13 edge affinity of the propagation (ASCII: the log line is compared as text)
         s += (f' + {float(aff_weight):g} * aff (edge BCE same-label: 0.5 cut / 0.25 LL+BB / 0.25 hard'
               f' {int(round(100 * float(hard_frac)))}% contrast)')
@@ -751,7 +846,8 @@ def make_term(name, snbl_tau=3.0, area_delta=0.05, hp_radius=10.0, hp_gamma=2.0,
 
 def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05,
                     boundary_weight=None, boundary_stages=None, boundary_radius=None, ring_radius=None,
-                    hp_radius=10.0, hp_gamma=2.0, aff_weight=None, comp_weight=0.0, hard_frac=0.2, **term_kw):
+                    hp_radius=10.0, hp_gamma=2.0, aff_weight=None, comp_weight=0.0, hard_frac=0.2, lsa_aux=None,
+                    lsa_tau=0.15, **term_kw):
     '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1); extra terms
     alone return EXP-6/7's WithExtraTerm; a boundary_weight (EXP-9, 0 allowed) wraps either in
     WithBoundaryAux. boundary_stages / boundary_radius (EXP-10) supervise the given heads with the
@@ -766,6 +862,12 @@ def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_t
     base = GT_BceDiceLoss(wb=1, wd=1) if loss == 'bcedice' else GT_BceRegionLoss(wb=1, wr=1)
     crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta, hp_radius, hp_gamma, **term_kw), w)
                                                         for n, w in terms])
+    if lsa_aux is not None:   # EXP-15
+        if boundary_weight is not None or aff_weight is not None:
+            raise ValueError('the expert aux loss does not combine with a boundary or affinity loss')
+        if lsa_aux not in ('probe', 'supervise'):
+            raise ValueError(f'lsa_aux must be probe or supervise, got {lsa_aux!r}')
+        return WithExpertAux(crit, 0.5, 0.3, lsa_tau, 3)
     if aff_weight is not None:   # EXP-13
         if boundary_weight is not None:
             raise ValueError('the propagation affinity loss does not combine with a boundary loss')
