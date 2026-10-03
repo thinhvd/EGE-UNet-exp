@@ -120,6 +120,7 @@ class CorePropagation(nn.Module):
         self.tau, self.kappa, self.beta = float(tau), float(kappa), float(beta)
         self.n_src = n_src
         self.enabled = True
+        self.feature_grad = False     # EXP-13 check only (analysis/exp13_featcheck.py): let the edge loss reach D5 / P1..P5
         self.s_one = False
         self.cap_off = False
         self.steps_override = None
@@ -163,7 +164,10 @@ class CorePropagation(nn.Module):
         p = [q if q.shape[2:4] == size else F.interpolate(q, size=size, mode='bilinear', align_corners=True)
              for q in projs[:self.n_src]]
         t_z, t_rgb, valid = image_relative(z_base.detach(), rgb, self.seed_thr)
-        x = torch.cat([d5, *p, z_base, rgb, t_z, t_rgb], 1).detach()
+        if self.feature_grad:
+            x = torch.cat([d5, *p, z_base.detach(), rgb, t_z, t_rgb], 1)
+        else:
+            x = torch.cat([d5, *p, z_base, rgb, t_z, t_rgb], 1).detach()
         return self.cell(x), t_z, valid, p[0].detach()
 
     def edge_logits(self, g):

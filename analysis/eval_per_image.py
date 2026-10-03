@@ -27,10 +27,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analysis import common as C
-from datasets.dataset import NPY_datasets
+from datasets.dataset import NPY_datasets, split_dataset
 
 CSV_FIELDS = ['filename', 'dsc', 'iou', 'oracle_dsc', 'tp', 'fp', 'fn', 'tn', 'area_frac', 'pred_area_frac',
               'cy', 'cx', 'centroid_offset', 'touches_border', 'bbox_y0', 'bbox_x0', 'bbox_y1', 'bbox_x1']
+INTERIOR_FIELDS = ['gt_interior', 'fn_interior']   # EXP-14, only with --interior-tau
 
 
 def oracle_dsc(prob, gt):
@@ -69,6 +70,10 @@ def parse_args():
     p.add_argument('--c-list', type=int, nargs=6, default=None)
     p.add_argument('--non-strict', action='store_true')
     p.add_argument('--max-images', type=int, default=None, help='debug: only evaluate the first N images')
+    p.add_argument('--split', default='val', help='EXP-14: split folder of --data-path to evaluate (val | test | train)')
+    p.add_argument('--interior-tau', type=float, default=None,
+                   help='EXP-14: also count GT pixels with normalized depth >= tau and the missed ones among them '
+                        '(columns gt_interior, fn_interior; contour_losses.normalized_depth)')
     return p.parse_args()
 
 
@@ -94,9 +99,13 @@ def main():
         print(f'gate override "{args.gate_override}" applied to {n} GHPA modules')
 
     config = C.make_config(args.dataset, args.input_size)
-    ds = NPY_datasets(args.data_path, config, train=False)
+    ds = NPY_datasets(args.data_path, config, train=False) if args.split == 'val' else \
+        split_dataset(args.data_path, config, args.split)
     n = len(ds) if args.max_images is None else min(args.max_images, len(ds))
-    print(f'val images: {n}  (dataset={args.dataset}, input={args.input_size}, threshold={args.threshold})')
+    fields = CSV_FIELDS + (INTERIOR_FIELDS if args.interior_tau is not None else [])
+    if args.interior_tau is not None:
+        from contour_losses import normalized_depth
+    print(f'{args.split} images: {n}  (dataset={args.dataset}, input={args.input_size}, threshold={args.threshold})')
 
     thresholds = [args.threshold]
     if args.thresholds:
@@ -128,16 +137,20 @@ def main():
                    'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
                    'pred_area_frac': float(pred.mean())}
             row.update(C.mask_descriptors(gt))
+            if args.interior_tau is not None:
+                inner = (normalized_depth(msk[None]) [0, 0].numpy() >= args.interior_tau) & gt
+                row['gt_interior'] = int(inner.sum())
+                row['fn_interior'] = int((inner & ~pred).sum())
             rows.append(row)
             if (i + 1) % 100 == 0:
                 print(f'  {i + 1}/{n}')
     TP, FP, FN, TN = pooled_thr[args.threshold]
 
     with open(out_csv, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, restval='')
+        w = csv.DictWriter(f, fieldnames=fields, restval='')
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, '') for k in CSV_FIELDS})
+            w.writerow({k: r.get(k, '') for k in fields})
 
     pooled = C.pooled_metrics(TP, FP, FN, TN)
     dscs = np.array([r['dsc'] for r in rows]); ious = np.array([r['iou'] for r in rows])
@@ -147,7 +160,8 @@ def main():
     odscs = np.array([r['oracle_dsc'] for r in rows])
     summary = {
         'checkpoint': ckpt, 'checkpoint_meta': meta, 'model_config': cfg, 'dataset': args.dataset,
-        'data_path': args.data_path, 'input_size': args.input_size, 'threshold': args.threshold,
+        'data_path': args.data_path, 'split': args.split, 'interior_tau': args.interior_tau,
+        'input_size': args.input_size, 'threshold': args.threshold,
         'shift': [dx, dy], 'gate_override': args.gate_override, 'n_images': n,
         'pooled': pooled,
         'per_image': {'mean_dsc': float(dscs.mean()), 'median_dsc': float(np.median(dscs)),

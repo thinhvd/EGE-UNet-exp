@@ -246,6 +246,21 @@ through the propagation. tau, kappa, beta come from `analysis/exp13_step0.py` (t
 knockouts). Checks: `python tests/test_propagation.py`. Every EXP-4..11 configuration is bit-identical to the
 EXP-11 code.
 
+**5i. EXP-14: new 70:10:20 protocol and interior hard-positive loss (branch `exp/14-ihp`).**
+
+From EXP-14 on, the author's val split (which doubled as the test set) is divided into a new val (1/3: checkpoint
+selection and every pre-training choice) and a held-out test (2/3), stratified by lesion-area tertile:
+`python scripts/make_split_701020.py` builds `data/data_isic1718_701020/` from the committed lists in `analysis/lists/`.
+`--test-split test` makes `train.py` test the best checkpoint on that folder; the headline metric is the per-image
+mean DSC on the test split with paired per-image t-tests (`analysis/exp14_summary.py`), pooled DSC is kept for
+reference. Loss terms added with `--extra-term`: `ihp` (focal BCE on lesion pixels whose normalized depth, distance to
+the background over the largest such distance in the image, is >= `--ihp-tau` and that the model misses), `focal`
+(`--focal-alpha/-gamma`) and `tversky` (`--tversky-alpha/-beta`). tau and the weights are fixed on train / val by
+`analysis/exp14_step0.py` and `analysis/exp14_lambda_sweep.py`. Runs: [scripts/exp14_train.sh](scripts/exp14_train.sh),
+[scripts/exp14_box.sh](scripts/exp14_box.sh), [scripts/exp14_analyze.sh](scripts/exp14_analyze.sh). Checks:
+`python tests/test_exp14.py <mini root with train/val/test>`. Every earlier configuration is bit-identical to the
+EXP-13 code.
+
 **6. Repository layout and experiment workflow.**
 
 ```

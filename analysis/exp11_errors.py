@@ -38,7 +38,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analysis import common as C                                                    # noqa: E402
 from analysis.exp09_mechanism import GroundTruth, pooled, error_tests, write_csv, vn, px, BINS  # noqa: E402
-from datasets.dataset import NPY_datasets                                           # noqa: E402
+from datasets.dataset import NPY_datasets, split_dataset                            # noqa: E402
 
 TERTILES = ('small', 'mid', 'large')
 DEFAULT_THRESHOLDS = ','.join(f'{t / 100:g}' for t in range(10, 91, 5))
@@ -52,8 +52,9 @@ def parse_args():
     p.add_argument('--pair', action='append', default=[], metavar='VAR=REF')
     p.add_argument('--dataset', required=True, choices=['isic17', 'isic18'])
     p.add_argument('--data-path', required=True)
-    p.add_argument('--split', default='val', choices=['val', 'train'],
-                   help='train = the train images with the test transform (no augmentation)')
+    p.add_argument('--split', default='val', choices=['val', 'train', 'test'],
+                   help='train = the train images with the test transform (no augmentation); test = the held-out '
+                        'test folder of the EXP-14 70:10:20 protocol')
     p.add_argument('--focus', action='append', default=[], metavar='NAME=CSV',
                    help='an image set to report on its own: a csv with an "image" column (file name without extension)')
     p.add_argument('--drop', action='append', default=[], metavar='IMAGE',
@@ -77,9 +78,11 @@ def load_focus(specs, names):
         label, path = spec.split('=', 1)
         wanted = [r['image'] for r in csv.DictReader(open(path))]
         missing = [w for w in wanted if w not in index]
-        if missing:
-            sys.exit(f'--focus {label}: {len(missing)} image(s) not in this split, e.g. {missing[:3]}')
-        out[label] = sorted(index[w] for w in wanted)
+        if len(missing) == len(wanted):
+            sys.exit(f'--focus {label}: none of its {len(wanted)} images is in this split')
+        if missing:   # EXP-14: the heavy set of the old val split is partly in the new val, partly in the new test
+            print(f'  --focus {label}: {len(wanted) - len(missing)} of {len(wanted)} images are in this split; the rest are skipped')
+        out[label] = sorted(index[w] for w in wanted if w in index)
     return out
 
 
@@ -130,11 +133,14 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     device = C.pick_device(a.device)
     config = C.make_config(a.dataset, 256)
-    ds = NPY_datasets(a.data_path, config, train=(a.split == 'train'))
-    ds.transformer = config.test_transformer
+    if a.split == 'test':
+        ds = split_dataset(a.data_path, config, 'test')
+    else:
+        ds = NPY_datasets(a.data_path, config, train=(a.split == 'train'))
+        ds.transformer = config.test_transformer
     n = len(ds) if a.max_images is None else min(a.max_images, len(ds))
-    if a.focus and a.split != 'val':
-        sys.exit('--focus sets are image lists of the val split')
+    if a.focus and a.split == 'train':
+        sys.exit('--focus sets are image lists of the (old) val split')
     thresholds = sorted({round(float(t), 4) for t in a.thresholds.split(',')} | {a.threshold})
     print(f'{a.dataset} {a.split}: {n} images; thresholds {thresholds}')
     gt = GroundTruth(ds, n, a.near, a.mid)

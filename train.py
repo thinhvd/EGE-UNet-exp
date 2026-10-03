@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from datasets.dataset import NPY_datasets
+from datasets.dataset import NPY_datasets, split_dataset
 from models.egeunet import EGEUNet
 
 from engine import *
@@ -103,7 +103,7 @@ def parse_args():
                              'contour_losses.py): tv (ACL length), tv_match (length matched to GT), area '
                              '(log-ratio area), bl (boundary loss, px), snbl (boundary loss in lesion radii), '
                              'fn_dp (misses weighted by distance to the prediction), hp (EXP-11 focal BCE on '
-                             'lesion pixels deeper than --hp-radius). Default: none. '
+                             'lesion pixels deeper than --hp-radius), ihp / focal / tversky (EXP-14). Default: none. '
                              f'Choices: {", ".join(EXTRA_TERMS[1:])}')
     parser.add_argument('--extra-weight', type=str, default=None,
                         help='weight(s) of --extra-term, comma-separated in the same order (required with it)')
@@ -114,6 +114,15 @@ def parse_args():
     parser.add_argument('--hp-radius', type=float, default=10.0,
                         help='hp: a lesion pixel counts as deep when its distance to the background exceeds this '
                              'many px at 256 (default 10)')
+    parser.add_argument('--ihp-tau', type=float, default=0.2,
+                        help='EXP-14 ihp: a lesion pixel is interior when its distance to the background is at least this '
+                             'fraction of the largest such distance in the image (default 0.2; fix it on train / val)')
+    parser.add_argument('--ihp-gamma', type=float, default=2.0, help='EXP-14 ihp: focal exponent on (1 - u)')
+    parser.add_argument('--ihp-plow', type=float, default=0.5, help='EXP-14 ihp: only interior pixels with u below this')
+    parser.add_argument('--focal-alpha', type=float, default=0.75, help='EXP-14 focal: weight of class 1 (default 0.75)')
+    parser.add_argument('--focal-gamma', type=float, default=2.0, help='EXP-14 focal: focusing exponent (default 2)')
+    parser.add_argument('--tversky-alpha', type=float, default=0.3, help='EXP-14 tversky: weight of FP (default 0.3)')
+    parser.add_argument('--tversky-beta', type=float, default=0.7, help='EXP-14 tversky: weight of FN (default 0.7)')
     parser.add_argument('--hp-gamma', type=float, default=2.0,
                         help='hp: focal exponent on (1 - u) (default 2; 0 = plain BCE on the deep pixels)')
     parser.add_argument('--boundary-weight', type=float, default=None,
@@ -160,6 +169,10 @@ def parse_args():
                         help='EXP-13: weight of the completion loss on the propagated map (pair_coupled only)')
     parser.add_argument('--hard-frac', type=float, default=0.2,
                         help='EXP-13: share of each image\'s lesion-lesion edges, by contrast, treated as hard "do not cut" edges')
+    parser.add_argument('--test-split', type=str, default=None,
+                        help='EXP-14 protocol (70:10:20): after training, test the best checkpoint on this split folder of '
+                             '--data-path (e.g. "test") instead of the val split; val keeps selecting the checkpoint. '
+                             'Default: test on val, as the original code does')
     parser.add_argument('--save-every', type=int, default=None,
                         help='also keep the weights of every N-th epoch from --save-from on '
                              '(checkpoints/epochNNN.pth), to measure how much the chosen epoch matters. '
@@ -451,12 +464,20 @@ def main(config):
         if getattr(config, 'save_every', None) and epoch >= config.save_from and epoch % config.save_every == 0:
             atomic_torch_save(model.state_dict(), os.path.join(checkpoint_dir, f'epoch{epoch:03d}.pth'))
 
+    test_split = getattr(config, 'test_split', None)
+    test_loader = val_loader
+    if test_split:   # EXP-14: a held-out test split, never seen during training or checkpoint selection
+        test_loader = DataLoader(split_dataset(config.data_path, config, test_split), batch_size=1, shuffle=False,
+                                 pin_memory=True, num_workers=config.num_workers, drop_last=True)
+        log_info = f'test split: {test_split} ({len(test_loader.dataset)} images); checkpoint selection on val ({len(val_dataset)} images)'
+        print(log_info)
+        logger.info(log_info)
     if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
         print('#----------Testing----------#')
         best_weight = torch.load(os.path.join(checkpoint_dir, 'best.pth'), map_location=torch.device('cpu'))
         model.load_state_dict(best_weight)
         loss, test_metrics = test_one_epoch(
-                val_loader,
+                test_loader,
                 model,
                 select_criterion,
                 logger,
@@ -469,6 +490,8 @@ def main(config):
         )
         results = {'min_epoch': min_epoch, 'min_loss': float(min_loss),
                    'test_loss': float(loss), 'checkpoint': best_name}
+        if test_split:
+            results.update({'test_split': test_split, 'n_test_images': len(test_loader.dataset)})
         results.update(test_metrics)
         with open(os.path.join(config.work_dir, 'test_results.json'), 'w') as f:
             json.dump(results, f, indent=2)

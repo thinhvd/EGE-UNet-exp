@@ -30,3 +30,17 @@ class NPY_datasets(Dataset):
         return len(self.data)
         
     
+
+
+def split_dataset(path_Data, config, split):
+    '''EXP-14: an NPY_datasets over any split folder of path_Data ('val', 'test', 'train'), with the test transform.
+    The class itself is unchanged; only the file list is replaced (same sorted image / mask pairing).'''
+    ds = NPY_datasets(path_Data, config, train=False)
+    if split != 'val':
+        images_dir = os.path.join(path_Data, split, 'images')
+        masks_dir = os.path.join(path_Data, split, 'masks')
+        images_list, masks_list = sorted(os.listdir(images_dir)), sorted(os.listdir(masks_dir))
+        if len(images_list) != len(masks_list):
+            raise ValueError(f'{path_Data}/{split}: {len(images_list)} images but {len(masks_list)} masks')
+        ds.data = [[os.path.join(images_dir, i), os.path.join(masks_dir, m)] for i, m in zip(images_list, masks_list)]
+    return ds

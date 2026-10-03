@@ -251,6 +251,13 @@ def get_config(args=None):
         if 'hp' in [t.strip() for t in extra_term.split(',')]:   # EXP-11, only then (older configs unchanged)
             config.loss_config['hp_radius'] = getattr(args, 'hp_radius', 10.0)
             config.loss_config['hp_gamma'] = getattr(args, 'hp_gamma', 2.0)
+        names = [t.strip() for t in extra_term.split(',')]   # EXP-14 terms, keys only when used
+        if 'ihp' in names:
+            config.loss_config.update(ihp_tau=args.ihp_tau, ihp_gamma=args.ihp_gamma, ihp_plow=args.ihp_plow)
+        if 'focal' in names:
+            config.loss_config.update(focal_alpha=args.focal_alpha, focal_gamma=args.focal_gamma)
+        if 'tversky' in names:
+            config.loss_config.update(tversky_alpha=args.tversky_alpha, tversky_beta=args.tversky_beta)
         if boundary_weight is not None:   # only then, so the EXP-6/7/8 configs stay exactly as before
             config.loss_config['boundary_weight'] = boundary_weight
             if refine == 'gate':   # EXP-10: the loss supervises the dec5 head with the contour zone
@@ -265,6 +272,7 @@ def get_config(args=None):
             config.loss_config['hard_frac'] = getattr(args, 'hard_frac', 0.2)
         config.criterion = build_criterion(**config.loss_config)
         config.selection_criterion = GT_BceDiceLoss(wb=1, wd=1)
+    config.test_split = getattr(args, 'test_split', None)   # EXP-14 70:10:20 protocol
     config.save_every = getattr(args, 'save_every', None)
     config.save_from = getattr(args, 'save_from', 200)
     config.device = args.device

@@ -59,6 +59,17 @@ EXP-11 (models/completion.py, --complete):
         (r = 10 px, gamma = 2). Normalized like utils.BCELoss, so its weight multiplies BCE directly on
         the deep lesion pixels; F.binary_cross_entropy clamps the log at -100 as the original loss does.
 
+EXP-14 (70:10:20 protocol; extra terms added to the original loss with a weight fixed on train / val):
+  ihp      interior hard-positive: mean over all B*H*W pixels of 1[g = 1, depth_norm >= tau, u < p_low] *
+           (1 - u)^gamma * BCE(u, 1), depth_norm = distance of a lesion pixel to the background divided by the
+           largest such distance in that image (0 on the contour, 1 at the deepest point), so "interior" means the
+           same fraction of the lesion whatever its size; the u < p_low gate (no gradient) keeps only pixels the
+           model currently misses.
+  focal    binary focal loss (Lin et al. 2017) on the final output, mean over pixels:
+           -alpha g (1 - u)^gamma log u - (1 - alpha)(1 - g) u^gamma log(1 - u); alpha > 0.5 weights class 1 up.
+  tversky  Tversky loss (Salehi et al. 2017) per image, mean over the batch:
+           1 - (TP + 1) / (TP + a FP + b FN + 1) with soft counts; b > a penalizes misses more than spill.
+
 EXP-13 (models/propagation.py, --propagate):
   aff   the edge head of the core-to-region propagation, S = P(same label) on edges between neighbouring cells of
         the 128 grid (GT average-pooled 2x2, >= 0.5). Edge groups: X = edges crossing the GT contour, LL = both
@@ -81,7 +92,7 @@ import torch.nn.functional as F
 from utils import BCELoss, BceDiceLoss, GT_BceDiceLoss
 
 LOSS_MODES = ['bcedice', 'bce_region']
-EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp', 'hp']
+EXTRA_TERMS = ['none', 'tv', 'tv_match', 'area', 'bl', 'snbl', 'fn_dp', 'hp', 'ihp', 'focal', 'tversky']
 TV_EPS = 1e-8
 BOUNDARY_STAGE_WEIGHTS = {'dec3': 0.1, 'dec4': 0.2, 'dec5': 0.3}
 
@@ -237,6 +248,29 @@ def edge_masks(target, size, hard_contrast=None, hard_frac=0.2):
                 thr = torch.quantile(v.float(), 1 - hard_frac) if v.numel() <= 16_000_000 else v.float().sort()[0][int((1 - hard_frac) * v.numel())]
                 hard[b] = m & (hard_contrast[b] >= thr)
         out['LL_hard'] = hard
+    return out
+
+
+def normalized_depth(target, backend=None):
+    '''EXP-14: per image, the distance of every lesion pixel to the nearest background pixel divided by the largest
+    such distance in that image (1 at the deepest lesion pixel, -> 0 at the contour); 0 outside the lesion and for
+    empty masks; a mask with no background gets 1 on every lesion pixel. GPU tensors (or backend='torch') use
+    edt_torch, CPU tensors scipy.'''
+    g = target.detach() >= 0.5
+    out = torch.zeros(g.shape, dtype=torch.float32, device=g.device)
+    use_torch = backend == 'torch' or (backend is None and g.is_cuda)
+    if not use_torch:
+        from scipy.ndimage import distance_transform_edt
+    for b in range(g.shape[0]):
+        m = g[b, 0]
+        if not m.any():
+            continue
+        if m.all():
+            out[b, 0] = 1.0
+            continue
+        d = edt_torch(~m) if use_torch else torch.from_numpy(distance_transform_edt(m.cpu().numpy())).float().to(g.device)
+        d = d * m
+        out[b, 0] = d / d.max()
     return out
 
 
@@ -410,8 +444,61 @@ def completion_term(r, lab, seed, dilate_cells=10):
     return (bce * region).sum() / region.sum()
 
 
+class InteriorHardPositive(nn.Module):
+    '''EXP-14: focal BCE on the lesion pixels that lie in the interior (normalized depth >= tau) and that the model
+    currently misses (u < p_low, gate without gradient). Mean over all pixels, like utils.BCELoss.'''
+    def __init__(self, tau=0.2, gamma=2.0, p_low=0.5):
+        super().__init__()
+        if not 0 <= tau < 1 or not 0 < p_low <= 1 or (gamma != 0 and gamma < 1):
+            raise ValueError(f'ihp needs 0 <= tau < 1, 0 < p_low <= 1, gamma 0 or >= 1; got {tau}, {p_low}, {gamma}')
+        self.tau, self.gamma, self.p_low = float(tau), float(gamma), float(p_low)
+
+    def mask(self, u, target):
+        return ((normalized_depth(target) >= self.tau) & (target >= 0.5) & (u.detach() < self.p_low)).float()
+
+    def forward(self, u, target):
+        m = self.mask(u, target)
+        bce = F.binary_cross_entropy(u, torch.ones_like(u), reduction='none')
+        w = (1 - u) ** self.gamma if self.gamma else 1.0
+        return (m * w * bce).mean()
+
+
+class FocalLoss(nn.Module):
+    '''EXP-14: binary focal loss on probabilities, mean over pixels (log clamped at -100 like nn.BCELoss).'''
+    def __init__(self, alpha=0.75, gamma=2.0):
+        super().__init__()
+        if not 0 < alpha < 1 or gamma < 0:
+            raise ValueError(f'focal needs 0 < alpha < 1 and gamma >= 0; got {alpha}, {gamma}')
+        self.alpha, self.gamma = float(alpha), float(gamma)
+
+    def forward(self, u, target):
+        g = (target >= 0.5).float()
+        # F.binary_cross_entropy clamps the log at -100 with a finite gradient at u = 0 or 1 (torch.log would give nan)
+        pos = F.binary_cross_entropy(u, torch.ones_like(u), reduction='none')
+        neg = F.binary_cross_entropy(u, torch.zeros_like(u), reduction='none')
+        loss = self.alpha * g * (1 - u) ** self.gamma * pos + (1 - self.alpha) * (1 - g) * u ** self.gamma * neg
+        return loss.mean()
+
+
+class TverskyLoss(nn.Module):
+    '''EXP-14: 1 - (TP + 1) / (TP + alpha FP + beta FN + 1) per image with soft counts, mean over the batch.'''
+    def __init__(self, alpha=0.3, beta=0.7):
+        super().__init__()
+        if alpha < 0 or beta < 0:
+            raise ValueError(f'tversky needs alpha, beta >= 0; got {alpha}, {beta}')
+        self.alpha, self.beta = float(alpha), float(beta)
+
+    def forward(self, u, target):
+        g = (target >= 0.5).float()
+        tp = _per_image(u * g).sum(1)
+        fp = _per_image(u * (1 - g)).sum(1)
+        fn = _per_image((1 - u) * g).sum(1)
+        return (1 - (tp + 1) / (tp + self.alpha * fp + self.beta * fn + 1)).mean()
+
+
 TERM_CLASSES = {'fn_dp': FNDistance, 'tv': TVLength, 'tv_match': TVMatch, 'area': LogArea,
-                'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss, 'hp': HardPositive}
+                'bl': BoundaryLoss, 'snbl': ScaleNormBoundaryLoss, 'hp': HardPositive,
+                'ihp': InteriorHardPositive, 'focal': FocalLoss, 'tversky': TverskyLoss}
 
 
 # ----------------------------------------------------------------------------- criteria
@@ -619,6 +706,13 @@ def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weig
         s += f' (delta {kw.get("area_delta", 0.05)})'
     if 'hp' in names:
         s += f' (hp r={float(kw.get("hp_radius", 10.0)):g}px, gamma {float(kw.get("hp_gamma", 2.0)):g})'
+    if 'ihp' in names:
+        s += (f' (ihp depth>={float(kw.get("ihp_tau", 0.2)):g}, p<{float(kw.get("ihp_plow", 0.5)):g}, '
+              f'gamma {float(kw.get("ihp_gamma", 2.0)):g})')
+    if 'focal' in names:
+        s += f' (focal alpha {float(kw.get("focal_alpha", 0.75)):g}, gamma {float(kw.get("focal_gamma", 2.0)):g})'
+    if 'tversky' in names:
+        s += f' (tversky alpha {float(kw.get("tversky_alpha", 0.3)):g}, beta {float(kw.get("tversky_beta", 0.7)):g})'
     if boundary_weight is not None:
         bw = float(boundary_weight)
         if ring_radius is not None:   # EXP-11 barrier head of the region completion (ASCII, see below)
@@ -639,19 +733,25 @@ def describe(loss='bcedice', extra_term='none', extra_weight=None, boundary_weig
     return s
 
 
-def make_term(name, snbl_tau=3.0, area_delta=0.05, hp_radius=10.0, hp_gamma=2.0):
+def make_term(name, snbl_tau=3.0, area_delta=0.05, hp_radius=10.0, hp_gamma=2.0, **kw):
     if name == 'snbl':
         return ScaleNormBoundaryLoss(tau=snbl_tau)
     if name == 'area':
         return LogArea(delta=area_delta)
     if name == 'hp':
         return HardPositive(radius=hp_radius, gamma=hp_gamma)
+    if name == 'ihp':
+        return InteriorHardPositive(kw.get('ihp_tau', 0.2), kw.get('ihp_gamma', 2.0), kw.get('ihp_plow', 0.5))
+    if name == 'focal':
+        return FocalLoss(kw.get('focal_alpha', 0.75), kw.get('focal_gamma', 2.0))
+    if name == 'tversky':
+        return TverskyLoss(kw.get('tversky_alpha', 0.3), kw.get('tversky_beta', 0.7))
     return TERM_CLASSES[name]()
 
 
 def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_tau=3.0, area_delta=0.05,
                     boundary_weight=None, boundary_stages=None, boundary_radius=None, ring_radius=None,
-                    hp_radius=10.0, hp_gamma=2.0, aff_weight=None, comp_weight=0.0, hard_frac=0.2):
+                    hp_radius=10.0, hp_gamma=2.0, aff_weight=None, comp_weight=0.0, hard_frac=0.2, **term_kw):
     '''The training criterion. Defaults return the original GT_BceDiceLoss(wb=1, wd=1); extra terms
     alone return EXP-6/7's WithExtraTerm; a boundary_weight (EXP-9, 0 allowed) wraps either in
     WithBoundaryAux. boundary_stages / boundary_radius (EXP-10) supervise the given heads with the
@@ -659,9 +759,12 @@ def build_criterion(loss='bcedice', extra_term='none', extra_weight=None, snbl_t
     +-r px contour ring.'''
     if loss not in LOSS_MODES:
         raise ValueError(f'unknown loss {loss!r}; choose from {LOSS_MODES}')
+    unknown = set(term_kw) - {'ihp_tau', 'ihp_gamma', 'ihp_plow', 'focal_alpha', 'focal_gamma', 'tversky_alpha', 'tversky_beta'}
+    if unknown:
+        raise ValueError(f'unknown loss options {sorted(unknown)}')
     terms = parse_terms(extra_term, extra_weight)
     base = GT_BceDiceLoss(wb=1, wd=1) if loss == 'bcedice' else GT_BceRegionLoss(wb=1, wr=1)
-    crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta, hp_radius, hp_gamma), w)
+    crit = base if not terms else WithExtraTerm(base, [(n, make_term(n, snbl_tau, area_delta, hp_radius, hp_gamma, **term_kw), w)
                                                         for n, w in terms])
     if aff_weight is not None:   # EXP-13
         if boundary_weight is not None:
