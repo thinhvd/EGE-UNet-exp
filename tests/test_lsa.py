@@ -248,9 +248,12 @@ def main():
     check('lsa flags: lsa_mode / lsa_aux, loss lsa_aux / lsa_tau', rc == 0 and c1['model'] == {'lsa_mode': 'route', 'lsa_aux': 'supervise'}
           and {'lsa_aux', 'lsa_tau'} <= set(c1['loss']), str(c1))
     for label, flags in (('--lsa with deep3', ['--fusion', 'sum', '--fusion-stages', 'deep3', '--lsa', 'route']),
-                         ('--lsa with --extra-term', csf + ['--lsa', 'route', '--extra-term', 'bl', '--extra-weight', '0.1'])):
+                         ('--lsa with --boundary-weight', csf + ['--lsa', 'route', '--boundary-weight', '0.1'])):
         rc, _ = cfg(base + flags)
         check(f'{label} refused', rc == 2)
+    # EXP-17: an extra term on the final output (E3a) combines with the expert aux losses
+    rc, c2 = cfg(base + csf + ['--lsa', 'route', '--extra-term', 'bl', '--extra-weight', '0.095'])
+    check('--lsa with --extra-term bl accepted (loss extra_term + lsa_aux)', rc == 0 and {'extra_term', 'extra_weight', 'lsa_aux'} <= set(c2['loss']), str(c2))
     if mini and os.path.isdir(os.path.join(mini, 'test', 'images')):
         wd = tempfile.mkdtemp()
         p = subprocess.run([py, '-W', 'ignore', 'train.py', '--work-dir', wd, '--data-path', mini, '--dataset', 'isic17', '--epochs', '1',

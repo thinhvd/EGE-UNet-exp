@@ -34,13 +34,17 @@ class NPY_datasets(Dataset):
 
 def split_dataset(path_Data, config, split):
     '''EXP-14: an NPY_datasets over any split folder of path_Data ('val', 'test', 'train'), with the test transform.
-    The class itself is unchanged; only the file list is replaced (same sorted image / mask pairing).'''
-    ds = NPY_datasets(path_Data, config, train=False)
-    if split != 'val':
-        images_dir = os.path.join(path_Data, split, 'images')
-        masks_dir = os.path.join(path_Data, split, 'masks')
-        images_list, masks_list = sorted(os.listdir(images_dir)), sorted(os.listdir(masks_dir))
-        if len(images_list) != len(masks_list):
-            raise ValueError(f'{path_Data}/{split}: {len(images_list)} images but {len(masks_list)} masks')
-        ds.data = [[os.path.join(images_dir, i), os.path.join(masks_dir, m)] for i, m in zip(images_list, masks_list)]
+    The class itself is unchanged; only the file list is replaced (same sorted image / mask pairing).
+    EXP-17: a split other than 'val' no longer lists path_Data/val (the 80/20 layout has no val folder); the object
+    holds the same file list and transform as before.'''
+    if split == 'val':
+        return NPY_datasets(path_Data, config, train=False)
+    images_dir = os.path.join(path_Data, split, 'images')
+    masks_dir = os.path.join(path_Data, split, 'masks')
+    images_list, masks_list = sorted(os.listdir(images_dir)), sorted(os.listdir(masks_dir))
+    if len(images_list) != len(masks_list):
+        raise ValueError(f'{path_Data}/{split}: {len(images_list)} images but {len(masks_list)} masks')
+    ds = NPY_datasets.__new__(NPY_datasets)
+    ds.data = [[os.path.join(images_dir, i), os.path.join(masks_dir, m)] for i, m in zip(images_list, masks_list)]
+    ds.transformer = config.test_transformer
     return ds

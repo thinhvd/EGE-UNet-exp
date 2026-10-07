@@ -285,4 +285,6 @@ def get_config(args=None):
     config.save_from = getattr(args, 'save_from', 200)
     config.device = args.device
     config.no_resume = args.no_resume
+    if getattr(args, 'no_val', False):   # EXP-17 80/20 protocol: no validation split (key absent otherwise)
+        config.no_val = True
     return config

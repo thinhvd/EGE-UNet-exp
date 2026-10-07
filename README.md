@@ -280,6 +280,19 @@ gates by region, forced gates / knockouts, oracle routing, aux heads); step 0 in
 `python tests/test_lsa.py <mini root with train/val/test>`. Every earlier configuration is bit-identical to the
 EXP-14 code.
 
+**5k. EXP-17: 80/20 protocol without a validation split, LSA-CSF with the original loss and E3a (branch `exp/17-lsa-8020`).**
+
+`python scripts/make_split_8020.py` builds `data/data_isic1718_8020/<ds>/{train,test}` from the committed lists
+`analysis/lists/split_8020_*.json` (author train + val pooled, 80 / 20 stratified by lesion-area tertile, seed 123;
+duplicate-pixel images forced into train; ISIC2018 files renamed tr_/va_ because both author folders use the same names).
+`train.py --no-val --test-split test` skips the validation loop and the best-checkpoint selection and tests the
+last-epoch weights (`checkpoints/final-epoch{E}.pth`); the headline model is the SWA average of epochs 200..300
+(`analysis/swa_average.py`). `--lsa` now combines with `--extra-term` (e.g. E3a `--extra-term bl --extra-weight 0.095`).
+`split_dataset` no longer needs a val folder. Runs: [scripts/exp17_train.sh](scripts/exp17_train.sh),
+[scripts/exp17_box.sh](scripts/exp17_box.sh), [scripts/exp17_analyze.sh](scripts/exp17_analyze.sh); local health watcher
+for rented boxes: [scripts/watch_box.sh](scripts/watch_box.sh). Checks: `python tests/test_exp17.py <mini root>`. Every
+earlier configuration is bit-identical to the EXP-16 code.
+
 **6. Repository layout and experiment workflow.**
 
 ```

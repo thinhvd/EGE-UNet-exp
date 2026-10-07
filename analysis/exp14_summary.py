@@ -32,6 +32,7 @@ def parse_args():
     p.add_argument('--ref2', default=None)
     p.add_argument('--pair', action='append', default=[], metavar='VAR=REF')
     p.add_argument('--title', default='EXP-14')
+    p.add_argument('--protocol', default='giao thức 70:10:20', help='EXP-17: protocol text of the title')
     p.add_argument('--out', required=True)
     return p.parse_args()
 
@@ -129,7 +130,7 @@ def main():
         w.writeheader()
         w.writerows(tests)
     st = lambda p: '' if not np.isfinite(p) else ('***' if p < 0.001 else '**' if p < 0.01 else '*' if p < 0.05 else '')
-    md = [f'# {a.title} — tập test riêng ({len(names)} ảnh), giao thức 70:10:20', '',
+    md = [f'# {a.title} — tập test riêng ({len(names)} ảnh), {a.protocol}', '',
           'Số chính: **DSC trung bình theo ảnh** (tính DSC từng ảnh rồi lấy trung bình) và paired t-test theo ảnh. DSC gộp '
           '(cách của paper gốc) chỉ để tham khảo. "Bỏ sót interior" = tỉ lệ pixel lesion có độ sâu chuẩn hóa ≥ τ mà model không tô.', '',
           '| Run | Mô tả | DSC TB theo ảnh | nhỏ · vừa · to | IoU TB | Precision TB | Recall TB | Bỏ sót interior | FP | DSC gộp (tham khảo) |',

@@ -188,7 +188,13 @@ def parse_args():
                              '(checkpoints/epochNNN.pth), to measure how much the chosen epoch matters. '
                              'Default: off (only best and latest, as before)')
     parser.add_argument('--save-from', type=int, default=200)
+    parser.add_argument('--no-val', action='store_true',
+                        help='EXP-17 protocol (80/20, no validation split): skip the val loop and the best-checkpoint '
+                             'selection; after training save the last-epoch weights as checkpoints/final-epoch{E}.pth and '
+                             'test them on --test-split (required). Default: off (validate every epoch, as the original code)')
     args = parser.parse_args()
+    if args.no_val and not args.test_split:
+        parser.error('--no-val needs --test-split (the split to test the last-epoch weights on)')
     parse_terms(args.extra_term or 'none', args.extra_weight)   # fail early on a malformed term list
     # EXP-9: the boundary-guided fusion and its band loss only make sense together, on dec3..dec5
     # (the band-loss weights are defined per stage there). 0 is a valid weight, so test against None.
@@ -250,8 +256,10 @@ def parse_args():
             parser.error('--lsa needs --fusion sum --fusion-stages shallow3')
         if refine is not None or complete is not None or propagate is not None:
             parser.error('--lsa does not combine with --refine / --complete / --propagate')
-        if args.boundary_weight is not None or (args.extra_term and args.extra_term != 'none'):
-            parser.error('--lsa brings its own aux losses; drop --boundary-weight / --extra-term')
+        # EXP-17: an extra loss term on the final output (e.g. E3a, --extra-term bl) combines with the expert aux
+        # losses (WithExpertAux wraps WithExtraTerm); the boundary heads of --boundary-weight do not exist here
+        if args.boundary_weight is not None:
+            parser.error('--lsa brings its own aux heads; drop --boundary-weight')
     if args.boundary_weight is not None and args.fusion != 'bg_stage' and refine != 'gate' and complete is None:
         parser.error('--boundary-weight only goes with --fusion bg_stage, --refine gate or --complete')
     if args.boundary_weight is not None and args.boundary_weight < 0:
@@ -301,13 +309,16 @@ def main(config):
                                 shuffle=True,
                                 pin_memory=True,
                                 num_workers=config.num_workers)
-    val_dataset = NPY_datasets(config.data_path, config, train=False)
-    val_loader = DataLoader(val_dataset,
-                                batch_size=1,
-                                shuffle=False,
-                                pin_memory=True,
-                                num_workers=config.num_workers,
-                                drop_last=True)
+    no_val = getattr(config, 'no_val', False)   # EXP-17: 80/20 protocol, no validation split
+    val_dataset, val_loader = None, None
+    if not no_val:
+        val_dataset = NPY_datasets(config.data_path, config, train=False)
+        val_loader = DataLoader(val_dataset,
+                                    batch_size=1,
+                                    shuffle=False,
+                                    pin_memory=True,
+                                    num_workers=config.num_workers,
+                                    drop_last=True)
 
 
 
@@ -447,14 +458,17 @@ def main(config):
             writer
         )
 
-        loss, val_metrics = val_one_epoch(
-                val_loader,
-                model,
-                select_criterion,
-                epoch,
-                logger,
-                config
-            )
+        if no_val:   # no selection: val_loss is logged as nan and best.pth is never written
+            loss, val_metrics = float('nan'), None
+        else:
+            loss, val_metrics = val_one_epoch(
+                    val_loader,
+                    model,
+                    select_criterion,
+                    epoch,
+                    logger,
+                    config
+                )
 
         if loss < min_loss:
             atomic_torch_save(model.state_dict(), os.path.join(checkpoint_dir, 'best.pth'))
@@ -491,10 +505,28 @@ def main(config):
     if test_split:   # EXP-14: a held-out test split, never seen during training or checkpoint selection
         test_loader = DataLoader(split_dataset(config.data_path, config, test_split), batch_size=1, shuffle=False,
                                  pin_memory=True, num_workers=config.num_workers, drop_last=True)
-        log_info = f'test split: {test_split} ({len(test_loader.dataset)} images); checkpoint selection on val ({len(val_dataset)} images)'
+        log_info = (f'test split: {test_split} ({len(test_loader.dataset)} images); ' +
+                    ('no validation split: testing the last-epoch weights' if no_val else
+                     f'checkpoint selection on val ({len(val_dataset)} images)'))
         print(log_info)
         logger.info(log_info)
-    if os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
+    if no_val:   # EXP-17: the weights in memory are the last epoch's (also after resuming a finished run)
+        print('#----------Testing (last epoch)----------#')
+        final_name = f'final-epoch{config.epochs}.pth'
+        atomic_torch_save(model.state_dict(), os.path.join(checkpoint_dir, final_name))
+        loss, test_metrics = test_one_epoch(
+                test_loader,
+                model,
+                select_criterion,
+                logger,
+                config,
+            )
+        results = {'min_epoch': config.epochs, 'min_loss': float('nan'), 'test_loss': float(loss), 'checkpoint': final_name,
+                   'no_val': True, 'test_split': test_split, 'n_test_images': len(test_loader.dataset)}
+        results.update(test_metrics)
+        with open(os.path.join(config.work_dir, 'test_results.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+    elif os.path.exists(os.path.join(checkpoint_dir, 'best.pth')):
         print('#----------Testing----------#')
         best_weight = torch.load(os.path.join(checkpoint_dir, 'best.pth'), map_location=torch.device('cpu'))
         model.load_state_dict(best_weight)
